@@ -1,0 +1,12 @@
+{
+  "name": "meterwatch",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node app.ts"
+  }
+}
