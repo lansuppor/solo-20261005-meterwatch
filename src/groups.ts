@@ -45,7 +45,7 @@ function err(message: string): void {
 }
 
 /** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
-function loadGroups(path: string): Group[] {
+export function loadGroups(path: string): Group[] {
   let text: string;
   try {
     text = readFileSync(path, 'utf8');

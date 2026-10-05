@@ -1,43 +1,59 @@
 // 每日能耗阈值告警:规则管理、评估、告警历史查询与确认。
 //
-// - 规则由使用者指定非空唯一标识,绑定一个已有设备与非负、最多三位小数的
-//   kWh 阈值;创建后设备与阈值固定。相同标识等价参数重试成功且不重复创建,
-//   异参重试报冲突。
-// - 评估针对连续完整 UTC 日期(起日含、止日不含),复用 daily 的完整时序、
-//   均匀分摊与累计比例向下取整口径;仅全天有效覆盖的日期可判定,消耗严格
-//   大于阈值才超限,等于阈值视为正常;有未知或下降覆盖时不可判定,不触发
-//   也不恢复;零增长是有效数据。
-// - 每条规则的每个日期独立跟踪:首次判定超限创建带唯一标识的未确认告警,
-//   重复超限保留原标识且不新增事件;后续完整评估正常才记录恢复;恢复后再
-//   超限创建新的未确认告警,旧记录保留,原确认不转移给新告警。
-// - 确认按告警标识,已恢复告警也可确认;重复确认成功且不重复记事;确认不
-//   改变超限或恢复状态。
-// - 规则与历史存于数据目录的 alerts.json(与 readings.json 相互独立,导入
-//   不触碰本文件,也不会自动评估)。创建、评估、确认都先在内存完成全部计算
-//   再一次性原子写入,任何失败不留下部分状态;损坏或不可读存储明确报错,
-//   绝不当作空库。
+// - 规则由使用者指定非空唯一标识(在设备与分组两类规则间唯一),绑定一个已有
+//   设备或已有分组与非负、最多三位小数的 kWh 阈值;设备与分组即使同名也是不同
+//   目标;创建后绑定目标与阈值固定。相同标识、同目标类型、同目标标识及等价阈值
+//   重试成功且不重复创建,异参重试报冲突。
+// - 评估针对连续完整 UTC 日期(起日含、止日不含)。设备规则复用 daily 的完整
+//   时序、均匀分摊与累计比例向下取整口径;分组规则不冻结创建时成员,按当时生效
+//   的成员版本计算(允许日内切换),联合覆盖口径与 group daily 相同:首个版本
+//   生效前为未知,任一成员下降为异常,否则任一成员未知为未知。仅全天有效覆盖的
+//   日期可判定,消耗严格大于阈值才超限,等于阈值视为正常;有未知或异常覆盖时不
+//   可判定,不触发也不恢复;零增长是有效数据。
+// - 每条规则的每个日期独立跟踪:首次判定超限创建带全局唯一标识的未确认告警,
+//   重复超限保留原标识且不新增事件;后续完整评估正常才记录恢复;恢复后再超限
+//   创建新的未确认告警,旧记录保留,原确认不转移给新告警。
+// - 确认按告警标识,已恢复告警也可确认;重复确认成功且不重复记事;确认不改变
+//   超限或恢复状态。历史查询只读,展示当前计算的消耗或不可判定原因,不改写原
+//   触发/恢复时的消耗记录,也不隐式恢复。
+// - 规则与历史存于数据目录的 alerts.json(与 readings.json、groups.json 相互
+//   独立,导入与成员版本补录不触碰本文件,也不会自动评估)。创建、评估、确认都
+//   先在内存完成全部计算再一次性原子写入,任何失败不留下部分状态;损坏或不可读
+//   存储明确报错,绝不当作空库。旧版只有设备规则的 alerts.json 无需手工转换。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   alertFilePath,
   dataFilePath,
+  groupFilePath,
   loadStore,
   parseStoredMilli,
   StoreError,
   type Reading,
 } from './store.ts';
 import { computeDay, DAY_SECONDS } from './report.ts';
+import { computeGroupSegment, loadGroups } from './groups.ts';
 import { formatIsoUtc, parseIso8601 } from './time.ts';
 import { formatKwh } from './value.ts';
 
+/** 规则目标类型:设备或分组;同名设备与分组是不同目标。 */
+export type RuleTargetType = 'device' | 'group';
+
 export interface AlertRule {
-  /** 规则标识(非空、唯一,已去首尾空白)。 */
+  /** 规则标识(非空、两类规则间唯一,已去首尾空白)。 */
   id: string;
-  /** 绑定设备(已去首尾空白,区分大小写),创建后固定。 */
-  device: string;
+  /** 目标类型,创建后固定。 */
+  targetType: RuleTargetType;
+  /** 绑定目标(设备或分组标识,已去首尾空白,区分大小写),创建后固定。 */
+  target: string;
   /** 阈值,毫千瓦时 BigInt,创建后固定。 */
   thresholdMilli: bigint;
+}
+
+/** 规则目标的展示形式(device=<id> 或 group=<id>),明确目标类型。 */
+function targetLabel(rule: AlertRule): string {
+  return `${rule.targetType}=${rule.target}`;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -111,18 +127,30 @@ function loadAlertState(path: string): AlertState {
     // 阈值兼容旧格式的安全整数数值;超出安全整数范围的数值型阈值精度已丢失,
     // 按损坏数据拒绝,不猜测原值。
     const thresholdMilli = r !== null && typeof r === 'object' ? parseStoredMilli(r.thresholdMilli) : null;
-    const ok =
-      r !== null &&
-      typeof r === 'object' &&
-      typeof r.id === 'string' &&
-      r.id.length > 0 &&
-      typeof r.device === 'string' &&
-      r.device.length > 0 &&
-      thresholdMilli !== null;
-    if (!ok) throw bad('invalid rule entry');
-    if (ruleIds.has(r.id as string)) throw bad(`duplicate rule id '${r.id}'`);
-    ruleIds.add(r.id as string);
-    rules.push({ id: r.id as string, device: r.device as string, thresholdMilli: thresholdMilli as bigint });
+    if (
+      r === null ||
+      typeof r !== 'object' ||
+      typeof r.id !== 'string' ||
+      r.id.length === 0 ||
+      thresholdMilli === null
+    ) {
+      throw bad('invalid rule entry');
+    }
+    // 目标:device(设备规则,含旧版格式)或 group(分组规则),恰好其一。
+    const hasDevice = r.device !== undefined;
+    const hasGroup = r.group !== undefined;
+    if (hasDevice === hasGroup) throw bad('invalid rule entry');
+    const target = hasDevice ? r.device : r.group;
+    if (typeof target !== 'string' || target.length === 0) throw bad('invalid rule entry');
+    const id = r.id as string;
+    if (ruleIds.has(id)) throw bad(`duplicate rule id '${id}'`);
+    ruleIds.add(id);
+    rules.push({
+      id,
+      targetType: hasDevice ? 'device' : 'group',
+      target: target as string,
+      thresholdMilli: thresholdMilli as bigint,
+    });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -171,7 +199,11 @@ function saveAlertState(path: string, state: AlertState): void {
       {
         version: 1,
         ...state,
-        rules: state.rules.map((r) => ({ ...r, thresholdMilli: r.thresholdMilli.toString() })),
+        rules: state.rules.map((r) => ({
+          id: r.id,
+          ...(r.targetType === 'device' ? { device: r.target } : { group: r.target }),
+          thresholdMilli: r.thresholdMilli.toString(),
+        })),
       },
       null,
       2,
@@ -201,18 +233,70 @@ function deviceSeries(device: string): Reading[] {
   return series;
 }
 
+/**
+ * 载入全部读数并按设备整理完整时序(按时刻排序),供分组规则评估使用。
+ * 全库任一设备(包括非成员设备)同一实际时刻存在多条存储记录时抛 StoreError。
+ */
+function allSeriesChecked(): Map<string, Reading[]> {
+  const all = loadStore(dataFilePath());
+  const byDevice = new Map<string, Reading[]>();
+  for (const r of all) {
+    const list = byDevice.get(r.device);
+    if (list) list.push(r);
+    else byDevice.set(r.device, [r]);
+  }
+  for (const [device, list] of byDevice) {
+    list.sort((a, b) => a.ts - b.ts);
+    for (let i = 1; i < list.length; i++) {
+      if (list[i].ts === list[i - 1].ts) {
+        throw new StoreError(
+          `storage error: multiple stored readings for device '${device}' at ${formatIsoUtc(list[i].ts)}`,
+        );
+      }
+    }
+  }
+  return byDevice;
+}
+
+/** 一天的可判定统计:未知/异常覆盖秒数与分摊消耗(毫千瓦时)。 */
+interface DayDecision {
+  unknown: number;
+  anomaly: number;
+  consumption: bigint;
+}
+
+/**
+ * 构造规则在某个完整 UTC 日零点上的统计函数。
+ * 设备规则用绑定设备的完整时序;分组规则用当前成员版本与全库校验过的时序,
+ * 不冻结创建时成员。分组已不存在时返回错误消息字符串。
+ */
+function buildDayStats(rule: AlertRule): ((dayStart: number) => DayDecision) | string {
+  if (rule.targetType === 'device') {
+    const series = deviceSeries(rule.target);
+    return (dayStart) => computeDay(series, dayStart, dayStart + DAY_SECONDS);
+  }
+  const groups = loadGroups(groupFilePath());
+  const group = groups.find((g) => g.id === rule.target);
+  if (!group) return `unknown group '${rule.target}' referenced by rule '${rule.id}'`;
+  const seriesByDevice = allSeriesChecked();
+  return (dayStart) =>
+    computeGroupSegment(group.versions, seriesByDevice, dayStart, dayStart + DAY_SECONDS);
+}
+
 /** 不可判定原因(未知/异常覆盖秒数)。 */
 function undecidableReason(stats: { unknown: number; anomaly: number }): string {
   return `undecidable (unknown=${stats.unknown}s anomaly=${stats.anomaly}s)`;
 }
 
 /**
- * 创建规则。相同标识等价参数(同设备、同阈值)重试成功且不重复创建;
- * 异参重试报冲突。设备必须已有存储读数。返回进程退出码。
+ * 创建规则。相同标识、同目标类型、同目标标识及等价阈值重试成功且不重复创建;
+ * 异参重试报冲突。设备规则的设备必须已有存储读数,分组规则的分组必须已存在。
+ * 返回进程退出码。
  */
 export function cmdRuleCreate(opts: {
   id: string;
-  device: string;
+  targetType: RuleTargetType;
+  target: string;
   thresholdMilli: bigint;
 }): number {
   const statePath = alertFilePath();
@@ -227,38 +311,66 @@ export function cmdRuleCreate(opts: {
     throw e;
   }
 
+  const label = `${opts.targetType}=${opts.target}`;
   const existing = state.rules.find((r) => r.id === opts.id);
   if (existing) {
-    if (existing.device === opts.device && existing.thresholdMilli === opts.thresholdMilli) {
+    if (
+      existing.targetType === opts.targetType &&
+      existing.target === opts.target &&
+      existing.thresholdMilli === opts.thresholdMilli
+    ) {
       console.log(
-        `rule '${opts.id}' already exists with identical parameters (device=${existing.device} threshold=${formatKwh(existing.thresholdMilli)} kWh); unchanged`,
+        `rule '${opts.id}' already exists with identical parameters ` +
+          `(${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh); unchanged`,
       );
       return 0;
     }
     err(
       `rule '${opts.id}' already exists with different parameters ` +
-        `(stored device=${existing.device} threshold=${formatKwh(existing.thresholdMilli)} kWh, ` +
-        `got device=${opts.device} threshold=${formatKwh(opts.thresholdMilli)} kWh); conflict`,
+        `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh, ` +
+        `got ${label} threshold=${formatKwh(opts.thresholdMilli)} kWh); conflict`,
     );
     return 1;
   }
 
-  let devices: Set<string>;
-  try {
-    devices = new Set(loadStore(dataFilePath()).map((r) => r.device));
-  } catch (e) {
-    if (e instanceof StoreError) {
-      err(e.message);
+  if (opts.targetType === 'device') {
+    let devices: Set<string>;
+    try {
+      devices = new Set(loadStore(dataFilePath()).map((r) => r.device));
+    } catch (e) {
+      if (e instanceof StoreError) {
+        err(e.message);
+        return 1;
+      }
+      throw e;
+    }
+    if (!devices.has(opts.target)) {
+      err(`unknown device '${opts.target}': no stored readings; import readings before creating a rule`);
       return 1;
     }
-    throw e;
-  }
-  if (!devices.has(opts.device)) {
-    err(`unknown device '${opts.device}': no stored readings; import readings before creating a rule`);
-    return 1;
+  } else {
+    let groups: string[];
+    try {
+      groups = loadGroups(groupFilePath()).map((g) => g.id);
+    } catch (e) {
+      if (e instanceof StoreError) {
+        err(e.message);
+        return 1;
+      }
+      throw e;
+    }
+    if (!groups.includes(opts.target)) {
+      err(`unknown group '${opts.target}': configure the group before creating a rule`);
+      return 1;
+    }
   }
 
-  state.rules.push({ id: opts.id, device: opts.device, thresholdMilli: opts.thresholdMilli });
+  state.rules.push({
+    id: opts.id,
+    targetType: opts.targetType,
+    target: opts.target,
+    thresholdMilli: opts.thresholdMilli,
+  });
   try {
     saveAlertState(statePath, state);
   } catch (e) {
@@ -268,9 +380,7 @@ export function cmdRuleCreate(opts: {
     }
     throw e;
   }
-  console.log(
-    `rule '${opts.id}' created: device=${opts.device} threshold=${formatKwh(opts.thresholdMilli)} kWh`,
-  );
+  console.log(`rule '${opts.id}' created: ${label} threshold=${formatKwh(opts.thresholdMilli)} kWh`);
   return 0;
 }
 
@@ -294,7 +404,7 @@ export function cmdRuleList(): number {
   for (const r of rules) {
     const open = state.alerts.filter((a) => a.ruleId === r.id && a.status === 'triggered').length;
     console.log(
-      `rule ${r.id}  device=${r.device}  threshold=${formatKwh(r.thresholdMilli)} kWh  open alerts=${open}`,
+      `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  open alerts=${open}`,
     );
   }
   return 0;
@@ -302,6 +412,7 @@ export function cmdRuleList(): number {
 
 /**
  * 评估规则在连续完整 UTC 日期范围 [from, to) 上的超限情况。
+ * 设备规则按绑定设备、分组规则按当时生效成员版本逐日计算;
  * 全部日期计算并应用到内存状态后一次性原子写入,不部分提交。
  * 返回进程退出码。
  */
@@ -309,7 +420,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
   const statePath = alertFilePath();
   let state: AlertState;
   let rule: AlertRule;
-  let series: Reading[];
+  let dayStats: (dayStart: number) => DayDecision;
   try {
     state = loadAlertState(statePath);
     const found = state.rules.find((r) => r.id === opts.ruleId);
@@ -318,7 +429,12 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
       return 1;
     }
     rule = found;
-    series = deviceSeries(rule.device);
+    const built = buildDayStats(rule);
+    if (typeof built === 'string') {
+      err(built);
+      return 1;
+    }
+    dayStats = built;
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -331,9 +447,9 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
   const lines: string[] = [];
   for (let dayStart = opts.from; dayStart < opts.to; dayStart += DAY_SECONDS) {
     const date = formatIsoUtc(dayStart).slice(0, 10);
-    const stats = computeDay(series, dayStart, dayStart + DAY_SECONDS);
+    const stats = dayStats(dayStart);
     if (stats.unknown > 0 || stats.anomaly > 0) {
-      // 有未知或下降覆盖:不可判定,不触发也不恢复。
+      // 有未知或异常覆盖:不可判定,不触发也不恢复。
       lines.push(`  ${date}  ${undecidableReason(stats)}  no alert action`);
       continue;
     }
@@ -349,7 +465,9 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
         // 重复超限:保留原标识,不新增事件。
         lines.push(`  ${date}  ${cmp}  EXCEEDED  alert ${open.id} remains triggered`);
       } else {
-        const id = `alert-${state.nextAlertNum++}`;
+        // 全局唯一标识:不与任何既有告警冲突。
+        let id = `alert-${state.nextAlertNum++}`;
+        while (state.alerts.some((a) => a.id === id)) id = `alert-${state.nextAlertNum++}`;
         state.alerts.push({
           id,
           ruleId: rule.id,
@@ -388,21 +506,21 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
   }
 
   console.log(
-    `rule: ${rule.id}  device=${rule.device}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
   );
   for (const line of lines) console.log(line);
   return 0;
 }
 
 /**
- * 查询规则的告警历史。只读,不修改数据。
- * 给定日期范围时逐日展示消耗或不可判定原因及各次告警;省略范围时展示
- * 有告警记录的全部日期。返回进程退出码。
+ * 查询规则的告警历史。只读,不修改数据,不隐式恢复。
+ * 给定日期范围时逐日展示当前计算的消耗或不可判定原因及各次告警;省略范围时
+ * 展示有告警记录的全部日期。返回进程退出码。
  */
 export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }): number {
   let state: AlertState;
   let rule: AlertRule;
-  let series: Reading[];
+  let dayStats: (dayStart: number) => DayDecision;
   try {
     state = loadAlertState(alertFilePath());
     const found = state.rules.find((r) => r.id === opts.ruleId);
@@ -411,7 +529,12 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
       return 1;
     }
     rule = found;
-    series = deviceSeries(rule.device);
+    const built = buildDayStats(rule);
+    if (typeof built === 'string') {
+      err(built);
+      return 1;
+    }
+    dayStats = built;
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -432,7 +555,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
   }
 
   console.log(
-    `rule: ${rule.id}  device=${rule.device}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
   );
   if (dayStarts.length === 0) {
     console.log(`  no alerts recorded for rule '${rule.id}'`);
@@ -442,7 +565,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
   const threshold = rule.thresholdMilli;
   for (const dayStart of dayStarts) {
     const date = formatIsoUtc(dayStart).slice(0, 10);
-    const stats = computeDay(series, dayStart, dayStart + DAY_SECONDS);
+    const stats = dayStats(dayStart);
     if (stats.unknown > 0 || stats.anomaly > 0) {
       console.log(`  ${date}  ${undecidableReason(stats)}`);
     } else {
