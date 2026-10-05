@@ -45,7 +45,7 @@ function err(message: string): void {
 }
 
 /** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
-function loadGroups(path: string): Group[] {
+export function loadGroups(path: string): Group[] {
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
@@ -121,19 +121,28 @@ function saveGroups(path: string, groups: Group[]): void {
 }
 
 /**
- * 载入读数并取出指定设备的完整时序(按时刻排序)。
- * 同设备同一实际时刻存在多条存储记录时抛 StoreError。
+ * 载入读数并按设备分组,各组时序按时刻排序。
+ * 任一设备(包括未被任何分组引用的设备)同一实际时刻存在多条存储记录时
+ * 抛 StoreError:新功能拒绝全库重复身份,而不只是成员设备。
  */
-function deviceSeries(all: Reading[], device: string): Reading[] {
-  const series = all.filter((r) => r.device === device).sort((a, b) => a.ts - b.ts);
-  for (let i = 1; i < series.length; i++) {
-    if (series[i].ts === series[i - 1].ts) {
-      throw new StoreError(
-        `storage error: multiple stored readings for device '${device}' at ${formatIsoUtc(series[i].ts)}`,
-      );
+export function loadCheckedSeriesByDevice(all: Reading[]): Map<string, Reading[]> {
+  const byDevice = new Map<string, Reading[]>();
+  for (const r of all) {
+    const list = byDevice.get(r.device);
+    if (list) list.push(r);
+    else byDevice.set(r.device, [r]);
+  }
+  for (const [device, list] of byDevice) {
+    list.sort((a, b) => a.ts - b.ts);
+    for (let i = 1; i < list.length; i++) {
+      if (list[i].ts === list[i - 1].ts) {
+        throw new StoreError(
+          `storage error: multiple stored readings for device '${device}' at ${formatIsoUtc(list[i].ts)}`,
+        );
+      }
     }
   }
-  return series;
+  return byDevice;
 }
 
 /** 在按时刻升序的时序中找最后一条 ts <= s 的下标,无则 -1。 */
@@ -390,13 +399,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number }): n
 
   let seriesByDevice: Map<string, Reading[]>;
   try {
-    const all = loadStore(dataFilePath());
-    seriesByDevice = new Map();
-    for (const v of group.versions) {
-      for (const m of v.members) {
-        if (!seriesByDevice.has(m)) seriesByDevice.set(m, deviceSeries(all, m));
-      }
-    }
+    seriesByDevice = loadCheckedSeriesByDevice(loadStore(dataFilePath()));
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);

@@ -18,8 +18,8 @@ Usage:
   node app.ts readings [筛选...]    查询读数、区间与消耗
   node app.ts daily --from <iso> --to <iso> [--device <id>...]
                                     按 UTC 自然日核查能耗的只读日报
-  node app.ts rule create --id <id> --device <设备> --threshold <kWh>
-                                    创建每日能耗阈值告警规则
+  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh>
+                                    创建每日能耗阈值告警规则(设备或分组)
   node app.ts rule list             查看全部告警规则
   node app.ts evaluate --rule <id> --from <日期> --to <日期>
                                     评估规则在连续完整 UTC 日期上的超限情况
@@ -72,19 +72,28 @@ Usage:
   不完整,无有效覆盖显示无法计算。配置不改读数、规则和告警,导入不改配置。
 
 告警规则(rule / evaluate / alerts / ack):
-  规则标识非空唯一,绑定的设备必须已有存储读数(去首尾空白、区分大小写);
-  阈值非负、最多三位小数 kWh;创建后设备与阈值固定。相同标识等价参数重试
-  成功且不重复创建,异参重试报冲突。
+  规则标识非空且在设备与分组两类规则间唯一(去首尾空白、区分大小写);用
+  --device 绑定一个已有存储读数的设备,或用 --group 绑定一个已有分组(二者
+  恰好其一);设备与分组即使同名也是不同目标,列表与历史均显示目标类型。
+  阈值非负、最多三位小数 kWh;目标与阈值创建后固定,分组规则绑定分组标识、
+  不冻结创建时成员。相同标识、同目标类型、同目标标识及等价阈值重试成功且
+  不重复创建,任一不同即报冲突。
   evaluate 的 --from/--to 为 YYYY-MM-DD 的 UTC 日期,起日含、止日不含,
-  起日必须更早。评估口径与 daily 相同:仅全天有效覆盖的日期可判定,消耗
-  严格大于阈值才超限(等于为正常);有未知或下降覆盖的日期不可判定,不触发
-  也不恢复。每个规则每个日期独立跟踪:首次超限创建带唯一标识的未确认告警,
-  重复超限保留原标识;完整评估正常才记录恢复;恢复后再超限创建新的未确认
-  告警,旧记录保留,原确认不转移。批量日期评估要么全部提交要么不提交。
+  起日必须更早。设备规则评估口径与 daily 相同;分组规则与 group daily 的
+  联合覆盖口径相同:每天按当时生效的成员版本计算,允许日内切换,首个版本
+  生效前为未知,任一成员下降为异常,否则任一成员未知为未知;成员切换不
+  重置各设备原读数区间的分摊起点。仅全天有效覆盖的日期可判定,消耗严格
+  大于阈值才超限(等于为正常),零增长有效;有未知或下降覆盖的日期不可
+  判定,不触发也不恢复。每个规则每个日期独立跟踪:首次超限创建带全局
+  唯一标识的未确认告警,重复超限保留原标识;完整评估正常才记录恢复;恢复
+  后再超限创建新的未确认告警,旧记录保留,原确认不转移。批量日期评估要么
+  全部提交要么不提交。
   ack 按告警标识确认,已恢复告警也可确认;重复确认成功且不重复记事,确认
-  不改变超限或恢复状态。alerts 按规则和日期展示消耗或不可判定原因、各次
-  告警的标识、检测状态、确认状态及触发/恢复/确认的处理顺序;省略日期范围
-  时展示有告警记录的全部日期。导入不自动评估,补导后需显式重评。
+  不改变超限或恢复状态。alerts 按规则和日期展示当前计算的消耗或不可判定
+  原因、各次告警的标识、检测状态、确认状态及按发生顺序排列的触发/恢复/
+  确认事件(触发、恢复时的消耗为当时记录,不随后续数据改写);省略日期
+  范围时展示有告警记录的全部日期;查询只读,不会隐式恢复。导入读数或补录
+  成员版本都不自动评估,需显式重评才更新检测状态。
 
 CSV 格式:
   表头: ${CSV_HEADER}
@@ -203,23 +212,38 @@ function cmdRule(rest: string[]): number {
     return cmdRuleList();
   }
   if (sub === 'create') {
-    const flags = parseFlags(subrest, ['--id', '--device', '--threshold']);
+    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
-    const deviceRaw = oneFlag(flags, '--device');
+    const deviceList = flags.get('--device');
+    const groupList = flags.get('--group');
     const thresholdRaw = oneFlag(flags, '--threshold');
-    if (idRaw === null || deviceRaw === null || thresholdRaw === null) {
-      return usageError("'rule create' 需要 --id、--device、--threshold 各恰好一个");
+    if (idRaw === null || thresholdRaw === null) {
+      return usageError("'rule create' 需要 --id 与 --threshold 各恰好一个");
+    }
+    const hasDevice = deviceList !== undefined;
+    const hasGroup = groupList !== undefined;
+    if (hasDevice === hasGroup) {
+      return usageError("'rule create' 需恰好提供 --device <设备> 或 --group <分组> 之一");
+    }
+    if ((deviceList !== undefined && deviceList.length !== 1) ||
+      (groupList !== undefined && groupList.length !== 1)) {
+      return usageError("'rule create' 的目标选项只能出现一次");
     }
     const id = idRaw.trim();
     if (id === '') return usageError('规则标识不能为空');
-    const device = deviceRaw.trim();
-    if (device === '') return usageError("'--device' 的值不能为空");
     const thresholdMilli = parseKwh(thresholdRaw.trim());
     if (thresholdMilli === null) {
       return usageError(`阈值无效: '${thresholdRaw.trim()}'(需非负、最多三位小数的 kWh)`);
     }
-    return cmdRuleCreate({ id, device, thresholdMilli });
+    if (hasDevice) {
+      const device = (deviceList as string[])[0].trim();
+      if (device === '') return usageError("'--device' 的值不能为空");
+      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli });
+    }
+    const group = (groupList as string[])[0].trim();
+    if (group === '') return usageError("'--group' 的值不能为空");
+    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli });
   }
   if (sub === undefined) return usageError("'rule' 需要子命令 create 或 list");
   return usageError(`无法识别的 rule 子命令 '${sub}'`);
