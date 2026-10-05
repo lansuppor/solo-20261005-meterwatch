@@ -32,6 +32,12 @@ export function alertFilePath(): string {
   return join(dir, 'alerts.json');
 }
 
+/** 分组与成员版本的存储文件,与读数、告警文件同目录、相互独立。 */
+export function groupFilePath(): string {
+  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
+  return join(dir, 'groups.json');
+}
+
 /**
  * 解析存储中的毫千瓦时字段:十进制数字字符串,或旧格式的安全整数数值。
  * 其他形式(含超出安全整数范围的数值,精度已丢失)返回 null,由调用方按损坏处理。

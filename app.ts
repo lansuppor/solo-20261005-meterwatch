@@ -1,6 +1,7 @@
 import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
 import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
+import { cmdGroupConfig, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { parseKwh } from './src/value.ts';
 
@@ -25,6 +26,12 @@ Usage:
   node app.ts alerts --rule <id> [--from <日期> --to <日期>]
                                     查询规则的告警历史(只读)
   node app.ts ack <告警标识>         确认告警
+  node app.ts group config --id <id> --at <iso> --device <id>...
+                                    配置分组成员版本(从生效时刻起直到下一版本接替)
+  node app.ts group history --id <id>
+                                    查看分组成员版本历史(按生效时刻排序,只读)
+  node app.ts group daily --id <id> --from <iso> --to <iso>
+                                    按当时生效成员的分组能耗日报(只读)
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -62,6 +69,25 @@ Usage:
   告警的标识、检测状态、确认状态及触发/恢复/确认的处理顺序;省略日期范围
   时展示有告警记录的全部日期。导入不自动评估,补导后需显式重评。
 
+分组(group config / history / daily):
+  分组以首次配置建立,标识非空唯一(去首尾空白、区分大小写)。--at 为生效
+  时刻(秒精度、显式时区的真实 ISO8601),--device 可重复,指定一整套已有
+  设备,从该时刻(含)起生效,直到下一版本接替;允许乱序补录历史版本。
+  成员不能为空,同设备重复列出只算一次,成员顺序不影响等价性,设备可属于
+  多个分组。同组同一实际生效时刻、同成员集合重试成功且不新增,异成员集合
+  报冲突。配置整次成功或不提交,不改读数、规则和告警;导入也不改配置。
+  group history 按生效时刻列出各版本及其生效区间与成员。
+  group daily 按 UTC 自然日切分(--from 含、--to 不含且必须更晚,首尾日期
+  只统计重叠部分),按当时生效成员计算,不把最新成员套用到历史;首个版本
+  生效前记为未知。只有全部生效成员均处于非下降读数区间时才是有效覆盖,并
+  计入成员消耗之和;任一成员下降为异常覆盖,否则任一成员未知为未知覆盖。
+  异常与未知时段不计任何成员消耗,缺失设备不按零补齐;覆盖秒数按分组实际
+  时间计,不累加成员秒数。各设备片段仍以原读数区间起点累计比例向下取整,
+  日界线、查询边界与成员切换均不重置分摊起点,拆开查询相加一致。每天显示
+  生效成员及其时段、估算消耗与有效/异常/未知秒数(三者之和等于当天查询
+  时长);有异常或未知标为不完整,无有效覆盖显示无法计算,有效零增长显示
+  零,并汇总有效消耗。日报与历史只读,不写入数据。
+
 CSV 格式:
   表头: ${CSV_HEADER}
   device   设备标识(区分大小写,首尾空白忽略,去空白后不能为空)
@@ -81,6 +107,7 @@ CSV 格式:
 数据位置:
   $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json)
   $METERWATCH_DATA_DIR/alerts.json(告警规则与历史,与读数文件相互独立)
+  $METERWATCH_DATA_DIR/groups.json(分组与成员版本,与读数、告警文件相互独立)
 
 退出码: 0 成功;1 数据或读写错误;2 参数错误`;
 
@@ -250,6 +277,66 @@ function cmdAlertsEntry(rest: string[]): number {
   return cmdAlerts({ ruleId, from, to });
 }
 
+function cmdGroup(rest: string[]): number {
+  const [sub, ...subrest] = rest;
+  if (sub === 'config') {
+    const flags = parseFlags(subrest, ['--id', '--at', '--device']);
+    if (typeof flags === 'string') return usageError(flags);
+    const idRaw = oneFlag(flags, '--id');
+    const atRaw = oneFlag(flags, '--at');
+    const devicesRaw = flags.get('--device');
+    if (idRaw === null || atRaw === null || devicesRaw === undefined || devicesRaw.length === 0) {
+      return usageError("'group config' 需要 --id、--at 各恰好一个,以及至少一个 --device");
+    }
+    const id = idRaw.trim();
+    if (id === '') return usageError('分组标识不能为空');
+    const at = parseIso8601(atRaw.trim());
+    if (at === null) {
+      return usageError(`生效时刻无效: '${atRaw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`);
+    }
+    const devices: string[] = [];
+    for (const d of devicesRaw) {
+      const device = d.trim();
+      if (device === '') return usageError("'--device' 的值不能为空");
+      devices.push(device);
+    }
+    return cmdGroupConfig({ id, at, devices });
+  }
+  if (sub === 'history') {
+    const flags = parseFlags(subrest, ['--id']);
+    if (typeof flags === 'string') return usageError(flags);
+    const idRaw = oneFlag(flags, '--id');
+    if (idRaw === null) return usageError("'group history' 需要 --id 恰好一个");
+    const id = idRaw.trim();
+    if (id === '') return usageError('分组标识不能为空');
+    return cmdGroupHistory({ id });
+  }
+  if (sub === 'daily') {
+    const flags = parseFlags(subrest, ['--id', '--from', '--to']);
+    if (typeof flags === 'string') return usageError(flags);
+    const idRaw = oneFlag(flags, '--id');
+    const fromRaw = oneFlag(flags, '--from');
+    const toRaw = oneFlag(flags, '--to');
+    if (idRaw === null || fromRaw === null || toRaw === null) {
+      return usageError("'group daily' 需要 --id、--from、--to 各恰好一个(起点含、终点不含)");
+    }
+    const id = idRaw.trim();
+    if (id === '') return usageError('分组标识不能为空');
+    const from = parseIso8601(fromRaw.trim());
+    if (from === null) {
+      return usageError(`起始时刻无效: '${fromRaw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`);
+    }
+    const to = parseIso8601(toRaw.trim());
+    if (to === null) {
+      return usageError(`结束时刻无效: '${toRaw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`);
+    }
+    if (from >= to) return usageError('查询起点必须早于终点(--from < --to)');
+    return cmdGroupDaily({ id, from, to });
+  }
+  if (sub === undefined) return usageError("'group' 需要子命令 config、history 或 daily");
+  return usageError(`无法识别的 group 子命令 '${sub}'`);
+}
+
 function main(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
@@ -290,6 +377,7 @@ function main(args: string[]): number {
   if (cmd === 'rule') return cmdRule(rest);
   if (cmd === 'evaluate') return cmdEvaluateEntry(rest);
   if (cmd === 'alerts') return cmdAlertsEntry(rest);
+  if (cmd === 'group') return cmdGroup(rest);
 
   if (cmd === 'ack') {
     if (rest.length !== 1) return usageError("'ack' 需要且仅需要一个告警标识");
