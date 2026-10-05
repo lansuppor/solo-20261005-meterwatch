@@ -133,7 +133,7 @@ export function cmdImport(file: string): number {
 
   try {
     // 保留既有修正历史与重放识别能力:修正记录与读数同文件,导入只追加读数。
-    saveData(storePath, { readings: existing.concat(toAdd), corrections: data.corrections });
+    saveData(storePath, { readings: existing.concat(toAdd), corrections: data.corrections, undos: data.undos });
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
