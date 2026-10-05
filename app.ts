@@ -2,7 +2,7 @@ import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
 import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
-import { cmdCorrect, cmdCorrections } from './src/correct.ts';
+import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { parseKwh } from './src/value.ts';
 import type { CorrectionItem } from './src/store.ts';
@@ -37,7 +37,9 @@ Usage:
   node app.ts correct --request <id> --item --device <设备> --at <iso> --expect <kWh> --set <kWh>
                                     [--item --device ... --at ... --expect ... --set ...]...
                                     批量修正已存读数的累计值(整批成功或整批拒绝)
-  node app.ts corrections             查看修正历史(只读)
+  node app.ts undo --request <id> --target <修正请求id>
+                                    整批撤销一个已成功修正(整批恢复或整批拒绝)
+  node app.ts corrections             查看修正与撤销历史(只读)
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -96,6 +98,26 @@ Usage:
   记录不变,检测状态仍需显式 evaluate 更新;后续 import 按当前读数判重与
   冲突,并保留修正历史。
 
+撤销(undo):
+  undo 整批撤销一个已成功且未撤销的修正:--request 给出本次撤销的非空
+  请求标识,--target 给出目标修正请求标识(均去首尾空白、区分大小写)。
+  撤销与修正请求在数据目录内共用唯一标识空间,成功标识绑定操作类型和
+  内容;目标只能是成功修正,不能是撤销请求,也不允许挑选部分项撤销。
+  首次撤销只恢复目标中实际改变过的读数,还原为该修正记录的原值,不新增
+  或删除读数;每个待恢复身份必须存在、当前值精确等于原替换值,且没有
+  后来尚未撤销、实际改变过该读数的修正(后来改回相同数值也不能绕过
+  来源检查;相关后续修正先撤销后,可再撤销较早请求)。原修正中的同值项
+  不恢复、不阻塞;全部为同值项的目标仍可成功撤销,恢复数为零。任一项
+  不满足条件指出身份和原因、整次拒绝,不占用撤销标识。成功报告撤销
+  请求、目标和恢复数,保留原修正内容并标记已撤销;读数恢复、目标状态
+  与撤销成功记录同时原子持久化,写入失败保留操作前全部状态。同标识、
+  同目标重放返回原成功结果,不重新核验、不重复恢复、不新增历史;同
+  标识异目标或跨操作类型复用标识均报冲突;未知或已撤销目标报错。已
+  撤销修正的原请求重放仍返回原成功结果,不重新应用修正。撤销后
+  readings、daily、group daily 与 alerts 按当前读数重算;成员、规则
+  与告警历史不变,检测状态仍需显式 evaluate 更新。corrections 另按
+  成功发生顺序显示撤销请求与目标关系。
+
 告警规则(rule / evaluate / alerts / ack):
   规则标识非空且在设备与分组两类规则间唯一(去首尾空白、区分大小写);用
   --device 绑定一个已有存储读数的设备,或用 --group 绑定一个已有分组(二者
@@ -138,7 +160,7 @@ CSV 格式:
 
 数据位置:
   $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json;
-           读数与修正历史同文件保存,旧版无修正历史的文件可直接使用)
+           读数、修正与撤销历史同文件保存,旧版无修正、撤销历史的文件可直接使用)
   $METERWATCH_DATA_DIR/alerts.json(告警规则与历史,与读数文件相互独立)
   $METERWATCH_DATA_DIR/groups.json(分组配置,与读数、告警文件相互独立)
 
@@ -446,6 +468,21 @@ function cmdCorrectEntry(rest: string[]): number {
   return cmdCorrect(parsed.requestId, parsed.items);
 }
 
+function cmdUndoEntry(rest: string[]): number {
+  const flags = parseFlags(rest, ['--request', '--target']);
+  if (typeof flags === 'string') return usageError(flags);
+  const requestRaw = oneFlag(flags, '--request');
+  const targetRaw = oneFlag(flags, '--target');
+  if (requestRaw === null || targetRaw === null) {
+    return usageError("'undo' 需要 --request 与 --target 各恰好一个");
+  }
+  const requestId = requestRaw.trim();
+  if (requestId === '') return usageError('请求标识不能为空');
+  const targetId = targetRaw.trim();
+  if (targetId === '') return usageError('目标修正请求标识不能为空');
+  return cmdUndo(requestId, targetId);
+}
+
 function main(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
@@ -488,6 +525,7 @@ function main(args: string[]): number {
   if (cmd === 'alerts') return cmdAlertsEntry(rest);
   if (cmd === 'group') return cmdGroup(rest);
   if (cmd === 'correct') return cmdCorrectEntry(rest);
+  if (cmd === 'undo') return cmdUndoEntry(rest);
 
   if (cmd === 'corrections') {
     if (rest.length !== 0) return usageError("'corrections' 不接受参数");

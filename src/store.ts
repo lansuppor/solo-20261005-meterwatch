@@ -35,12 +35,25 @@ export interface Correction {
   requestId: string;
   /** 本次提交的修正项,按提交顺序保存。 */
   items: CorrectionItem[];
+  /** 是否已被成功撤销;旧版文件无此字段视为未撤销。 */
+  undone?: boolean;
+}
+
+export interface UndoRecord {
+  /** 撤销请求标识(已去除首尾空白,区分大小写),与修正请求共用唯一标识空间。 */
+  requestId: string;
+  /** 目标修正请求标识(只能是成功修正,不能是撤销请求)。 */
+  targetId: string;
+  /** 实际恢复的读数条数;重放时按原样报告,不重新核验。 */
+  restored: number;
 }
 
 export interface StoreData {
   readings: Reading[];
   /** 已成功提交的修正历史,按提交顺序;与读数同文件原子持久化。 */
   corrections: Correction[];
+  /** 已成功提交的撤销记录,按成功发生顺序;与读数、修正历史同文件原子持久化。 */
+  undos: UndoRecord[];
 }
 
 export class StoreError extends Error {}
@@ -76,6 +89,7 @@ export function parseStoredMilli(value: unknown): bigint | null {
 
 /**
  * 解析存储中的修正历史;字段缺失按空历史(旧版文件),存在但结构非法返回 null。
+ * 每条修正可带 undone 布尔标记(缺失视为未撤销)。
  */
 function parseStoredCorrections(value: unknown): Correction[] | null {
   if (value === undefined) return [];
@@ -90,7 +104,8 @@ function parseStoredCorrections(value: unknown): Correction[] | null {
       c.requestId.length === 0 ||
       !Array.isArray(c.items) ||
       c.items.length === 0 ||
-      ids.has(c.requestId)
+      ids.has(c.requestId) ||
+      (c.undone !== undefined && typeof c.undone !== 'boolean')
     ) {
       return null;
     }
@@ -115,7 +130,46 @@ function parseStoredCorrections(value: unknown): Correction[] | null {
       });
     }
     ids.add(c.requestId);
-    out.push({ requestId: c.requestId, items });
+    out.push({ requestId: c.requestId, items, ...(c.undone === true ? { undone: true } : {}) });
+  }
+  return out;
+}
+
+/**
+ * 解析存储中的撤销历史;字段缺失按空历史(旧版文件),存在但结构非法返回 null。
+ * 撤销与修正共用唯一标识空间:撤销标识不得与修正或其他撤销重复;目标必须是
+ * 已存在的修正且被标记为已撤销,每个目标至多被撤销一次,已撤销标记必须有
+ * 对应的撤销记录。
+ */
+function parseStoredUndos(value: unknown, corrections: Correction[]): UndoRecord[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const correctionIds = new Set(corrections.map((c) => c.requestId));
+  const undoneTargets = new Set<string>();
+  const out: UndoRecord[] = [];
+  const ids = new Set<string>();
+  for (const u of value as Array<Record<string, unknown>>) {
+    const ok =
+      u !== null &&
+      typeof u === 'object' &&
+      typeof u.requestId === 'string' &&
+      u.requestId.length > 0 &&
+      typeof u.targetId === 'string' &&
+      u.targetId.length > 0 &&
+      Number.isSafeInteger(u.restored) &&
+      (u.restored as number) >= 0;
+    if (!ok) return null;
+    const requestId = u.requestId as string;
+    const targetId = u.targetId as string;
+    if (ids.has(requestId) || correctionIds.has(requestId)) return null;
+    if (!correctionIds.has(targetId) || undoneTargets.has(targetId)) return null;
+    ids.add(requestId);
+    undoneTargets.add(targetId);
+    out.push({ requestId, targetId, restored: u.restored as number });
+  }
+  for (const c of corrections) {
+    const marked = c.undone === true;
+    if (marked !== undoneTargets.has(c.requestId)) return null;
   }
   return out;
 }
@@ -126,7 +180,7 @@ export function loadData(path: string): StoreData {
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { readings: [], corrections: [] };
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { readings: [], corrections: [], undos: [] };
     throw new StoreError(`cannot read storage file ${path}: ${(err as Error).message}`);
   }
   let data: unknown;
@@ -158,7 +212,11 @@ export function loadData(path: string): StoreData {
   if (corrections === null) {
     throw new StoreError(`storage file ${path} is corrupted (invalid corrections)`);
   }
-  return { readings: out, corrections };
+  const undos = parseStoredUndos((data as { undos?: unknown })?.undos, corrections);
+  if (undos === null) {
+    throw new StoreError(`storage file ${path} is corrupted (invalid undos)`);
+  }
+  return { readings: out, corrections, undos };
 }
 
 /** 只取读数的便捷封装;语义与 loadData 相同。 */
@@ -166,7 +224,7 @@ export function loadStore(path: string): Reading[] {
   return loadData(path).readings;
 }
 
-/** 原子写入存储(读数与修正历史同文件同时持久化);失败抛错,原有数据保持不变。 */
+/** 原子写入存储(读数、修正历史与撤销记录同文件同时持久化);失败抛错,原有数据保持不变。 */
 export function saveData(path: string, data: StoreData): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
@@ -183,6 +241,12 @@ export function saveData(path: string, data: StoreData): void {
             expectedMilli: it.expectedMilli.toString(),
             replacementMilli: it.replacementMilli.toString(),
           })),
+          ...(c.undone === true ? { undone: true } : {}),
+        })),
+        undos: data.undos.map((u) => ({
+          requestId: u.requestId,
+          targetId: u.targetId,
+          restored: u.restored,
         })),
       },
       null,
