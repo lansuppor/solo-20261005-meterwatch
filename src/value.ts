@@ -22,3 +22,12 @@ export function formatKwh(milli: number): string {
   const frac = String(abs % 1000).padStart(3, '0');
   return `${sign}${int}.${frac}`;
 }
+
+/** formatKwh 的 BigInt 版本,用于超过 Number 安全整数范围的汇总。 */
+export function formatKwhBig(milli: bigint): string {
+  const sign = milli < 0n ? '-' : '';
+  const abs = milli < 0n ? -milli : milli;
+  const int = abs / 1000n;
+  const frac = (abs % 1000n).toString().padStart(3, '0');
+  return `${sign}${int}.${frac}`;
+}
