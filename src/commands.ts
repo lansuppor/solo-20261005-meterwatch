@@ -2,7 +2,7 @@
 
 import { readFileSync } from 'node:fs';
 import { CsvError, parseCsv } from './csv.ts';
-import { loadStore, saveStore, StoreError, dataFilePath, type Reading } from './store.ts';
+import { loadData, loadStore, saveData, StoreError, dataFilePath, type Reading, type StoreData } from './store.ts';
 import { formatIsoUtc, parseIso8601 } from './time.ts';
 import { formatKwh, parseKwh } from './value.ts';
 
@@ -20,9 +20,9 @@ function err(message: string): void {
 export function cmdImport(file: string): number {
   const storePath = dataFilePath();
 
-  let existing: Reading[];
+  let data: StoreData;
   try {
-    existing = loadStore(storePath);
+    data = loadData(storePath);
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -30,6 +30,7 @@ export function cmdImport(file: string): number {
     }
     throw e;
   }
+  const existing = data.readings;
 
   let text: string;
   try {
@@ -131,7 +132,8 @@ export function cmdImport(file: string): number {
   }
 
   try {
-    saveStore(storePath, existing.concat(toAdd));
+    // 读数与修正历史同文件保存:导入新增读数时原样保留已有修正历史。
+    saveData(storePath, { readings: existing.concat(toAdd), corrections: data.corrections });
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);

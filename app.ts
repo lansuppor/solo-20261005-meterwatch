@@ -2,6 +2,7 @@ import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
 import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
+import { cmdCorrect, cmdCorrectHistory, type CorrectionItemInput } from './src/correct.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { parseKwh } from './src/value.ts';
 
@@ -32,6 +33,9 @@ Usage:
                                     查看分组成员版本历史(只读)
   node app.ts group daily --id <id> --from <iso> --to <iso>
                                     按当时生效成员的分组能耗日报(只读)
+  node app.ts correct --request <id> --fix <设备> <时刻> <预期原读数> <替换读数> [--fix ...]
+                                    批量修正已存读数的累计值(整批成功或整批拒绝)
+  node app.ts correct history       按成功提交顺序查看修正历史(只读)
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -95,6 +99,24 @@ Usage:
   范围时展示有告警记录的全部日期;查询只读,不会隐式恢复。导入读数或补录
   成员版本都不自动评估,需显式重评才更新检测状态。
 
+修正(correct / correct history):
+  correct 一次提交指定非空请求标识(--request,去首尾空白、区分大小写,在
+  当前数据目录内唯一)与至少一项 --fix 修正;每项给出设备、实际时刻(秒精度
+  ISO8601 带 Z 或数字时区偏移)、预期原读数与替换读数(均为非负、最多三位
+  小数的 kWh,任意大数精确)。读数身份为 (设备, 实际时刻),与请求标识相互
+  独立;只修改已有读数的累计值,不新增或删除读数;同批同一身份只允许一项。
+  首次提交把每项预期原值与操作前已存值精确比较,全部匹配才整体替换;替换值
+  可以等于原值,但仍须核验预期原值。任一项身份不存在或原值不符均明确指出
+  原因,整批拒绝,不改变其他项,也不占用请求标识(失败后同标识仍可用于
+  修改后的内容)。成功报告请求标识与实际改变数;读数替换与请求成功记录同次
+  原子写入 readings.json,写入失败保留操作前全部状态。同标识、同修正内容
+  重放直接返回原成功结果,不重新校验当前读数、不再次替换或新增历史,即使
+  随后另一个请求再次修正了这些读数也不覆盖后来的值;修正项顺序、等价时区
+  及等价十进制写法不影响内容等价性;同标识异内容报冲突且保持状态。
+  correct history 按成功提交顺序显示各请求及各项设备、时刻、原值与替换值,
+  只读。修正后 readings、daily、group daily 与 alerts 的当前消耗按新相邻
+  区间重算;分组成员、规则与告警记录不变,检测状态仍需显式 evaluate 更新。
+
 CSV 格式:
   表头: ${CSV_HEADER}
   device   设备标识(区分大小写,首尾空白忽略,去空白后不能为空)
@@ -112,7 +134,9 @@ CSV 格式:
   已超出安全整数范围(精度已丢失)按损坏数据拒绝,不猜测原值。
 
 数据位置:
-  $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json)
+  $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json;
+      读数与修正历史同文件保存,同次原子写入;旧版无 corrections 字段的文件
+      无需手工迁移即可使用)
   $METERWATCH_DATA_DIR/alerts.json(告警规则与历史,与读数文件相互独立)
   $METERWATCH_DATA_DIR/groups.json(分组配置,与读数、告警文件相互独立)
 
@@ -364,6 +388,63 @@ function cmdGroup(rest: string[]): number {
   return usageError(`无法识别的 group 子命令 '${sub}'`);
 }
 
+function cmdCorrectEntry(rest: string[]): number {
+  if (rest[0] === 'history') {
+    if (rest.length !== 1) return usageError("'correct history' 不接受参数");
+    return cmdCorrectHistory();
+  }
+  // correct --request <id> --fix <设备> <时刻> <预期原读数> <替换读数> [--fix ...]
+  let request: string | null = null;
+  const items: CorrectionItemInput[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    let opt = rest[i];
+    let inlineValue: string | undefined;
+    const eq = opt.indexOf('=');
+    if (opt.startsWith('--') && eq !== -1) {
+      inlineValue = opt.slice(eq + 1);
+      opt = opt.slice(0, eq);
+    }
+    if (opt === '--request') {
+      const value = inlineValue ?? rest[++i];
+      if (value === undefined) return usageError("选项 '--request' 缺少值");
+      if (request !== null) return usageError("选项 '--request' 只能出现一次");
+      request = value.trim();
+      if (request === '') return usageError('请求标识不能为空');
+    } else if (opt === '--fix') {
+      if (inlineValue !== undefined) {
+        return usageError("'--fix' 需要四个独立的值:--fix <设备> <时刻> <预期原读数> <替换读数>");
+      }
+      const quad = rest.slice(i + 1, i + 5);
+      if (quad.length < 4) {
+        return usageError("'--fix' 需要 <设备> <时刻> <预期原读数> <替换读数> 四个值");
+      }
+      i += 4;
+      const device = quad[0].trim();
+      if (device === '') return usageError("'--fix' 的设备标识不能为空");
+      const ts = parseIso8601(quad[1].trim());
+      if (ts === null) {
+        return usageError(
+          `'--fix' 的时刻无效: '${quad[1].trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`,
+        );
+      }
+      const expectedMilli = parseKwh(quad[2].trim());
+      if (expectedMilli === null) {
+        return usageError(`'--fix' 的预期原读数无效: '${quad[2].trim()}'(需非负、最多三位小数的 kWh)`);
+      }
+      const replacementMilli = parseKwh(quad[3].trim());
+      if (replacementMilli === null) {
+        return usageError(`'--fix' 的替换读数无效: '${quad[3].trim()}'(需非负、最多三位小数的 kWh)`);
+      }
+      items.push({ device, ts, expectedMilli, replacementMilli });
+    } else {
+      return usageError(`无法识别的参数 '${rest[i]}'`);
+    }
+  }
+  if (request === null) return usageError("'correct' 需要 --request <请求标识>");
+  if (items.length === 0) return usageError("'correct' 需要至少一个 --fix 修正项");
+  return cmdCorrect({ request, items });
+}
+
 function main(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
@@ -405,6 +486,7 @@ function main(args: string[]): number {
   if (cmd === 'evaluate') return cmdEvaluateEntry(rest);
   if (cmd === 'alerts') return cmdAlertsEntry(rest);
   if (cmd === 'group') return cmdGroup(rest);
+  if (cmd === 'correct') return cmdCorrectEntry(rest);
 
   if (cmd === 'ack') {
     if (rest.length !== 1) return usageError("'ack' 需要且仅需要一个告警标识");
