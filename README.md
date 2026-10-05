@@ -16,7 +16,38 @@ node app.ts daily \
   --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z   # 按 UTC 自然日的能耗日报
 node app.ts daily --device meter-1 --device meter-2 \
   --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z   # 只统计指定设备
+
+node app.ts rule create --id peak --device meter-1 --threshold 6   # 创建告警规则
+node app.ts rule list                                   # 查看全部规则
+node app.ts evaluate --rule peak \
+  --from 2026-01-01 --to 2026-02-01                     # 评估连续完整 UTC 日期
+node app.ts alerts --rule peak                          # 查询告警历史(只读)
+node app.ts alerts --rule peak --from 2026-01-01 --to 2026-01-10
+node app.ts ack alert-1                                 # 确认告警
 ```
+
+## 每日能耗阈值告警
+
+规则由使用者指定非空唯一标识,绑定一个已有设备(去首尾空白、区分大小写)
+与非负、最多三位小数的 kWh 阈值;创建后设备与阈值固定。相同标识等价参数
+重试成功且不重复创建,异参重试报冲突。
+
+`evaluate` 的 `--from`/`--to` 为 `YYYY-MM-DD` 的 UTC 日期,起日含、止日
+不含,起日必须更早。评估口径与 `daily` 相同(完整时序、均匀分摊、累计
+比例向下取整、BigInt 精确汇总):仅全天有效覆盖的日期可判定,消耗严格
+大于阈值才超限,等于阈值视为正常;有未知或下降覆盖的日期不可判定,不
+触发也不恢复;零增长是有效数据。
+
+每条规则的每个日期独立跟踪:首次判定超限创建带唯一标识的未确认告警,
+重复超限保留原标识且不新增事件;后续完整评估正常才记录恢复;恢复后再
+超限创建新的未确认告警,旧记录保留,原确认不转移给新告警。`ack` 按告警
+标识确认,已恢复告警也可确认;重复确认成功且不重复记事,确认不改变超限
+或恢复状态。`alerts` 按规则和日期展示消耗或不可判定原因、各次告警的
+标识、检测状态、确认状态及触发/恢复/确认的处理顺序;省略日期范围时展示
+有告警记录的全部日期。
+
+导入不自动评估,补导后需显式重评才会反映新的相邻区间。批量日期评估要么
+全部提交要么不提交;创建、评估、确认任一失败都保留操作前全部状态。
 
 ## CSV 格式
 
@@ -63,7 +94,8 @@ node app.ts daily --device meter-1 --device meter-2 \
 
 ## 数据位置
 
-`$METERWATCH_DATA_DIR/readings.json`,默认 `~/.meterwatch/readings.json`。
-退出后再次启动仍可查询。
+`$METERWATCH_DATA_DIR/readings.json`,默认 `~/.meterwatch/readings.json`;
+告警规则与历史存于同目录的 `alerts.json`,与读数文件相互独立,导入不会
+触碰告警状态。退出后再次启动仍可查询。
 
 退出码:0 成功;1 数据或读写错误;2 参数错误。

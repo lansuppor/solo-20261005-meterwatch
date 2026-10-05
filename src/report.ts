@@ -23,13 +23,13 @@ export interface DailyFilter {
   to: number;
 }
 
-const DAY_SECONDS = 86400;
+export const DAY_SECONDS = 86400;
 
 function err(message: string): void {
   console.error(`meterwatch: ${message}`);
 }
 
-interface DayStats {
+export interface DayStats {
   /** 有效(非下降区间)覆盖秒数。 */
   valid: number;
   /** 异常(下降区间)覆盖秒数。 */
@@ -41,7 +41,7 @@ interface DayStats {
 }
 
 /** 计算 [segStart, segEnd) 一天的统计;区间取自完整时序。 */
-function computeDay(series: Reading[], segStart: number, segEnd: number): DayStats {
+export function computeDay(series: Reading[], segStart: number, segEnd: number): DayStats {
   let valid = 0;
   let anomaly = 0;
   let consumption = 0n;

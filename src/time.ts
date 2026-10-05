@@ -45,6 +45,12 @@ export function parseIso8601(input: string): number | null {
   return dt.getTime() / 1000 - offsetSeconds;
 }
 
+/** 解析 YYYY-MM-DD 的 UTC 日期为该日零点的 epoch 秒;无效日期(如 2 月 30 日)返回 null。 */
+export function parseUtcDate(input: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input)) return null;
+  return parseIso8601(`${input}T00:00:00Z`);
+}
+
 /** 格式化为 UTC 的秒精度 ISO8601(带 Z)。 */
 export function formatIsoUtc(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString().replace(/\.000Z$/, 'Z');

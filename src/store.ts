@@ -22,6 +22,12 @@ export function dataFilePath(): string {
   return join(dir, 'readings.json');
 }
 
+/** 告警规则与历史的存储文件,与读数文件同目录、相互独立。 */
+export function alertFilePath(): string {
+  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
+  return join(dir, 'alerts.json');
+}
+
 /** 读取存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
 export function loadStore(path: string): Reading[] {
   let text: string;
