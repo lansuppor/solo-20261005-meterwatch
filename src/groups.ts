@@ -7,10 +7,11 @@
 //   异成员集合报冲突。
 // - 配置整次成功或不提交:未知设备、冲突、损坏或不可读存储及写入失败都明确
 //   报错并保留操作前状态。配置不改读数、规则和告警,导入也不改配置。
-// - 日报按 UTC 自然日切分(起点含、终点不含,首尾只统计重叠部分),按当时生效
-//   成员计算,不把最新成员套用到历史;首个版本生效前记为未知。各设备使用完整
-//   已存时序,区间两端读数即使在查询范围外也参与;成员切换不需要恰好有读数,
-//   首条读数之前、末条之后及孤立读数时段为未知,不外推。
+// - 日报按当地自然日切分(起点含、终点不含,首尾只统计重叠部分;默认 UTC,
+//   可用 --tz 指定 IANA 时区,时区只决定分日),按当时生效成员计算,不把
+//   最新成员套用到历史;首个版本生效前记为未知。各设备使用完整已存时序,
+//   区间两端读数即使在查询范围外也参与;成员切换不需要恰好有读数,首条
+//   读数之前、末条之后及孤立读数时段为未知,不外推。
 // - 每个时段只有全部生效成员均处于非下降读数区间时才是有效覆盖,并计入成员
 //   消耗之和;任一成员下降则为异常覆盖,否则任一成员未知则为未知覆盖。异常与
 //   未知时段不计任何成员消耗,不以缺失设备为零补齐。覆盖秒数按分组实际时间
@@ -22,8 +23,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { dataFilePath, groupFilePath, loadStore, StoreError, type Reading } from './store.ts';
-import { DAY_SECONDS } from './report.ts';
 import { formatIsoUtc } from './time.ts';
+import { localDays, loadTimezone } from './tz.ts';
 import { formatKwh } from './value.ts';
 
 export interface GroupVersion {
@@ -377,10 +378,17 @@ export function cmdGroupHistory(opts: { id: string }): number {
 }
 
 /**
- * 分组能耗日报:按 UTC 自然日切分,按当时生效成员计算。只读,不写入数据。
- * 返回进程退出码。
+ * 分组能耗日报:按当地自然日切分(默认 UTC,--tz 指定 IANA 时区),按当时
+ * 生效成员计算。只读,不写入数据。返回进程退出码。
  */
-export function cmdGroupDaily(opts: { id: string; from: number; to: number }): number {
+export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?: string }): number {
+  const tzName = opts.tz ?? 'UTC';
+  const tz = loadTimezone(tzName);
+  if (!tz) {
+    err(`unknown timezone '${tzName}' (expect an IANA timezone name supported by this runtime)`);
+    return 2;
+  }
+
   let groups: Group[];
   try {
     groups = loadGroups(groupFilePath());
@@ -408,39 +416,47 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number }): n
     throw e;
   }
 
+  const days = localDays(tz, opts.from, opts.to);
+
   console.log(`group: ${group.id}`);
+  console.log(`timezone: ${tzName}`);
   let total = 0n;
   let computedDays = 0;
-  let days = 0;
   let incomplete = false;
-  for (
-    let dayStart = Math.floor(opts.from / DAY_SECONDS) * DAY_SECONDS;
-    dayStart < opts.to;
-    dayStart += DAY_SECONDS
-  ) {
-    const segStart = Math.max(dayStart, opts.from);
-    const segEnd = Math.min(dayStart + DAY_SECONDS, opts.to);
-    const stats = computeGroupSegment(group.versions, seriesByDevice, segStart, segEnd);
-    days++;
-
-    const date = formatIsoUtc(dayStart).slice(0, 10);
-    const dayIncomplete = stats.anomaly > 0 || stats.unknown > 0;
+  for (const day of days) {
+    let valid = 0;
+    let anomaly = 0;
+    let unknown = 0;
+    let consumption = 0n;
+    const periods: GroupPeriod[] = [];
+    for (const p of day.periods) {
+      const stats = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end);
+      valid += stats.valid;
+      anomaly += stats.anomaly;
+      unknown += stats.unknown;
+      consumption += stats.consumption;
+      periods.push(...stats.periods);
+    }
+    const dayIncomplete = anomaly > 0 || unknown > 0;
     if (dayIncomplete) incomplete = true;
 
-    let consumption: string;
-    if (stats.valid > 0) {
-      consumption = `consumption=${formatKwh(stats.consumption)} kWh (estimate)`;
-      total += stats.consumption;
+    let consumptionText: string;
+    if (valid > 0) {
+      consumptionText = `consumption=${formatKwh(consumption)} kWh (estimate)`;
+      total += consumption;
       computedDays++;
     } else {
-      consumption = 'consumption=n/a (no valid coverage)';
+      consumptionText = 'consumption=n/a (no valid coverage)';
     }
     let line =
-      `  ${date}  ${consumption}` +
-      `  valid=${stats.valid}s  anomaly=${stats.anomaly}s  unknown=${stats.unknown}s`;
+      `  ${day.label}  ${consumptionText}` +
+      `  valid=${valid}s  anomaly=${anomaly}s  unknown=${unknown}s`;
     if (dayIncomplete) line += '  INCOMPLETE';
     console.log(line);
-    for (const p of stats.periods) {
+    for (const p of day.periods) {
+      console.log(`    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+    }
+    for (const p of periods) {
       const members = p.members === null ? '(no version in effect)' : p.members.join(',');
       console.log(
         `    members=${members}  period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`,
@@ -456,7 +472,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number }): n
     ? 'status=INCOMPLETE (unknown or anomaly coverage present)'
     : 'status=complete';
   console.log(
-    `  summary: group=${group.id}  computed=${computedDays}/${days} day(s)  ${totalText}  ${status}`,
+    `  summary: group=${group.id}  computed=${computedDays}/${days.length} day(s)  ${totalText}  ${status}`,
   );
   return 0;
 }

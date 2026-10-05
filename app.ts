@@ -4,6 +4,7 @@ import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './sr
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
+import { loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
 import type { CorrectionItem } from './src/store.ts';
 
@@ -18,8 +19,8 @@ Usage:
   node app.ts --help | -h           显示本帮助
   node app.ts import <file.csv>     导入 CSV 读数(整批成功或整批拒绝)
   node app.ts readings [筛选...]    查询读数、区间与消耗
-  node app.ts daily --from <iso> --to <iso> [--device <id>...]
-                                    按 UTC 自然日核查能耗的只读日报
+  node app.ts daily --from <iso> --to <iso> [--device <id>...] [--tz <时区>]
+                                    按当地自然日核查能耗的只读日报(默认 UTC 分日)
   node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh>
                                     创建每日能耗阈值告警规则(设备或分组)
   node app.ts rule list             查看全部告警规则
@@ -32,8 +33,8 @@ Usage:
                                     配置分组成员版本(首次配置即建立分组)
   node app.ts group history --id <id>
                                     查看分组成员版本历史(只读)
-  node app.ts group daily --id <id> --from <iso> --to <iso>
-                                    按当时生效成员的分组能耗日报(只读)
+  node app.ts group daily --id <id> --from <iso> --to <iso> [--tz <时区>]
+                                    按当时生效成员的分组能耗日报(只读,默认 UTC 分日)
   node app.ts correct --request <id> --item --device <设备> --at <iso> --expect <kWh> --set <kWh>
                                     [--item --device ... --at ... --expect ... --set ...]...
                                     批量修正已存读数的累计值(整批成功或整批拒绝)
@@ -52,15 +53,25 @@ Usage:
   --from <iso8601>  起始时刻(含),必填
   --to <iso8601>    结束时刻(不含),必填,必须晚于起点
   --device <id>     只统计指定设备(可重复使用);省略时统计库内全部设备
-  日期按 UTC 零点划分,首尾日期只统计与查询范围重叠的部分。
+  --tz <时区>       分日时区(IANA 名,如 Asia/Shanghai);省略时按 UTC
+  日期按分日时区的当地零点划分,首尾日期只统计与查询范围重叠的部分。
   估算口径:由每个设备完整时序的相邻读数构成区间,区间两端读数即使在
   查询范围外也参与;非下降区间把累计值之差按持续时间均匀分摊,以千分之一
   kWh 为单位,从区间起点累计到切点(查询边界与日界线)向下取整,片段消耗
   为两端累计量之差,故完整区间的分摊总量等于原差值,同一区间拆开查询再
   相加结果一致。下降区间不分摊,记为异常覆盖;首条读数之前、末条之后及
   孤立读数时段为未知,不外推。每天输出估算消耗与有效/异常/未知覆盖秒数
-  (三者之和等于该天查询时长);存在未知或异常覆盖时日报标记为不完整。
-  日报只读,不写入数据。
+  (三者之和等于该天实际统计的各 UTC 时段总秒数),并标明所用时区与各
+  UTC 时段;存在未知或异常覆盖时日报标记为不完整。日报只读,不写入数据。
+
+分日时区(--tz,daily 与 group daily 可选):
+  接受运行环境支持的 IANA 时区名(如 Asia/Shanghai、America/New_York);
+  未知时区名为参数错误,返回 2。时区只决定分日,不重新解释输入时刻或
+  已存读数。日界线按实际时刻的当地日期归属计算,不按固定 86400 秒或
+  全年固定偏移推算:夏令时前拨跳过的当天更短(跳过的小时不存在,不补
+  为未知),回拨当天更长(重复小时按各自实际时刻完整计入);同一当地
+  日期的不连续时段合并统计、分别列出;没有实际时段的当地日期不生成
+  日报。日界线不重置分摊起点,拆开查询再相加与整段一致。
 
 分组(group configure / history / daily):
   分组以首次 configure 建立,标识非空唯一(去首尾空白、区分大小写)。
@@ -70,8 +81,9 @@ Usage:
   生效直到下一版本接替,允许乱序补录历史版本。同组同一实际生效时刻、同
   成员集合重试成功且不新增,异成员集合报冲突;未知设备报错,配置整次成功
   或不提交。history 按生效时刻列出全部版本(只读)。daily 的 --from(含)
-  与 --to(不含)必填且起点必须更早,按 UTC 自然日切分、按当时生效成员
-  计算,首个版本生效前记为未知;每个时段只有全部生效成员均处于非下降读数
+  与 --to(不含)必填且起点必须更早,按分日时区的自然日切分(--tz 可选,
+  默认 UTC,口径见上文"分日时区"),按当时生效成员计算,首个版本生效前
+  记为未知;每个时段只有全部生效成员均处于非下降读数
   区间才是有效覆盖并计入成员消耗之和,任一成员下降为异常,否则任一成员
   未知为未知;异常与未知时段不计任何成员消耗,覆盖秒数按分组实际时间计;
   各设备片段仍以原读数区间起点累计比例向下取整,日界线、查询边界与成员
@@ -169,13 +181,15 @@ interface ParsedOptions {
   devices: string[];
   from?: number;
   to?: number;
+  tz?: string;
 }
 
-/** 解析 --device/--from/--to 选项;出错返回错误消息字符串。 */
-function parseOptions(rest: string[]): ParsedOptions | string {
+/** 解析 --device/--from/--to(及允许时的 --tz)选项;出错返回错误消息字符串。 */
+function parseOptions(rest: string[], allowTz = false): ParsedOptions | string {
   const devices: string[] = [];
   let from: number | undefined;
   let to: number | undefined;
+  let tz: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     let opt = rest[i];
     let value: string | undefined;
@@ -200,11 +214,22 @@ function parseOptions(rest: string[]): ParsedOptions | string {
       }
       if (opt === '--from') from = ts;
       else to = ts;
+    } else if (opt === '--tz' && allowTz) {
+      tz = value.trim();
+      if (tz === '') return "'--tz' 的值不能为空";
     } else {
       return `无法识别的选项 '${opt}'`;
     }
   }
-  return { devices, from, to };
+  return { devices, from, to, tz };
+}
+
+/** 校验 IANA 分日时区名;无效时返回错误消息字符串。 */
+function checkTz(tz: string): string | null {
+  if (loadTimezone(tz) === null) {
+    return `未知时区 '${tz}'(需运行环境支持的 IANA 时区名,如 Asia/Shanghai、America/New_York)`;
+  }
+  return null;
 }
 
 /** 解析 --opt value / --opt=value 形式的选项;出错返回错误消息字符串。 */
@@ -380,13 +405,17 @@ function cmdGroup(rest: string[]): number {
     return cmdGroupHistory({ id });
   }
   if (sub === 'daily') {
-    const flags = parseFlags(subrest, ['--id', '--from', '--to']);
+    const flags = parseFlags(subrest, ['--id', '--from', '--to', '--tz']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
     const fromRaw = oneFlag(flags, '--from');
     const toRaw = oneFlag(flags, '--to');
     if (idRaw === null || fromRaw === null || toRaw === null) {
       return usageError("'group daily' 需要 --id、--from、--to 各恰好一个(起点含、终点不含)");
+    }
+    const tzList = flags.get('--tz');
+    if (tzList !== undefined && tzList.length !== 1) {
+      return usageError("'group daily' 的 --tz 只能出现一次");
     }
     const id = idRaw.trim();
     if (id === '') return usageError('分组标识不能为空');
@@ -399,7 +428,14 @@ function cmdGroup(rest: string[]): number {
       return usageError(`选项 '--to' 的时间无效: '${toRaw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`);
     }
     if (from >= to) return usageError('查询起点必须早于终点(--from < --to)');
-    return cmdGroupDaily({ id, from, to });
+    let tz: string | undefined;
+    if (tzList !== undefined) {
+      tz = tzList[0].trim();
+      if (tz === '') return usageError("'--tz' 的值不能为空");
+      const bad = checkTz(tz);
+      if (bad !== null) return usageError(bad);
+    }
+    return cmdGroupDaily({ id, from, to, tz });
   }
   if (sub === undefined) return usageError("'group' 需要子命令 configure、history 或 daily");
   return usageError(`无法识别的 group 子命令 '${sub}'`);
@@ -502,7 +538,7 @@ function main(args: string[]): number {
   }
 
   if (cmd === 'daily') {
-    const parsed = parseOptions(rest);
+    const parsed = parseOptions(rest, true);
     if (typeof parsed === 'string') return usageError(parsed);
     if (parsed.from === undefined || parsed.to === undefined) {
       return usageError("'daily' 必须同时提供 --from 与 --to(起点含、终点不含)");
@@ -510,7 +546,11 @@ function main(args: string[]): number {
     if (parsed.from >= parsed.to) {
       return usageError('查询起点必须早于终点(--from < --to)');
     }
-    return cmdDaily({ devices: parsed.devices, from: parsed.from, to: parsed.to });
+    if (parsed.tz !== undefined) {
+      const bad = checkTz(parsed.tz);
+      if (bad !== null) return usageError(bad);
+    }
+    return cmdDaily({ devices: parsed.devices, from: parsed.from, to: parsed.to, tz: parsed.tz });
   }
 
   if (cmd === 'rule') return cmdRule(rest);

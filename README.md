@@ -14,6 +14,8 @@ node app.ts readings --device meter-1 \
   --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z
 node app.ts daily \
   --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z   # 按 UTC 自然日的能耗日报
+node app.ts daily --tz America/New_York \
+  --from 2026-03-01T00:00:00Z --to 2026-04-01T00:00:00Z   # 按指定 IANA 时区的当地自然日
 node app.ts daily --device meter-1 --device meter-2 \
   --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z   # 只统计指定设备
 
@@ -33,6 +35,8 @@ node app.ts group configure --id floor-1 \
 node app.ts group history --id floor-1                          # 查看成员版本历史(只读)
 node app.ts group daily --id floor-1 \
   --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z         # 分组能耗日报(只读)
+node app.ts group daily --id floor-1 --tz Asia/Shanghai \
+  --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z         # 按指定时区的当地自然日
 
 node app.ts correct --request REQ-2026-001 \
   --item --device meter-1 --at 2026-01-02T00:00:00Z --expect 110.000 --set 115.500 \
@@ -42,6 +46,22 @@ node app.ts undo --request UNDO-2026-001 --target REQ-2026-001
                                                           # 整批撤销一次已成功修正
 node app.ts corrections                                   # 查看修正与撤销历史(只读)
 ```
+
+## 分日时区(--tz)
+
+`daily` 与 `group daily` 接受可选的 `--tz <IANA 时区名>`(如
+`Asia/Shanghai`、`America/New_York`),按该时区的当地自然日划分日报;
+省略时按 UTC。时区只决定分日,不重新解释输入时刻或已存读数;设备筛选、
+分组选择与必填起止时刻(起点含、终点不含)沿用原有方式。
+
+日界线按实际时刻的当地日期归属计算,不用固定 86400 秒或全年固定偏移
+推算:夏令时前拨跳过的当天更短(跳过的小时不存在,不补为未知),回拨
+当天更长(重复小时按各自实际时刻完整计入)——例如 America/New_York 的
+2026-03-08 为 82800 秒、2026-11-01 为 90000 秒,覆盖分类以这些实际
+时长为准。同一当地日期的不连续时段合并统计、分别列出;没有实际时段的
+当地日期不生成日报。每天标明所用时区与实际统计的各 UTC 时段,
+有效/异常/未知秒数之和等于这些时段的总秒数;日界线不重置分摊起点,
+拆开查询再相加与整段一致。未知时区名为参数错误,返回 2。
 
 ## 读数修正(correct / corrections)
 
