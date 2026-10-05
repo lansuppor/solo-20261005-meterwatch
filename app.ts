@@ -4,7 +4,7 @@ import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './sr
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
-import { loadTimezone } from './src/tz.ts';
+import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
 import type { CorrectionItem } from './src/store.ts';
 
@@ -21,11 +21,11 @@ Usage:
   node app.ts readings [筛选...]    查询读数、区间与消耗
   node app.ts daily --from <iso> --to <iso> [--device <id>...] [--tz <时区>]
                                     按当地自然日核查能耗的只读日报(默认 UTC 分日)
-  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh>
-                                    创建每日能耗阈值告警规则(设备或分组)
+  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh> [--tz <时区>]
+                                    创建每日能耗阈值告警规则(设备或分组,时区省略为 UTC)
   node app.ts rule list             查看全部告警规则
   node app.ts evaluate --rule <id> --from <日期> --to <日期>
-                                    评估规则在连续完整 UTC 日期上的超限情况
+                                    评估规则在连续完整当地日期(按规则时区)上的超限情况
   node app.ts alerts --rule <id> [--from <日期> --to <日期>]
                                     查询规则的告警历史(只读)
   node app.ts ack <告警标识>         确认告警
@@ -127,25 +127,33 @@ Usage:
   规则标识非空且在设备与分组两类规则间唯一(去首尾空白、区分大小写);用
   --device 绑定一个已有存储读数的设备,或用 --group 绑定一个已有分组(二者
   恰好其一);设备与分组即使同名也是不同目标,列表与历史均显示目标类型。
-  阈值非负、最多三位小数 kWh;目标与阈值创建后固定,分组规则绑定分组标识、
-  不冻结创建时成员。相同标识、同目标类型、同目标标识及等价阈值重试成功且
-  不重复创建,任一不同即报冲突。
-  evaluate 的 --from/--to 为 YYYY-MM-DD 的 UTC 日期,起日含、止日不含,
-  起日必须更早。设备规则评估口径与 daily 相同;分组规则与 group daily 的
-  联合覆盖口径相同:每天按当时生效的成员版本计算,允许日内切换,首个版本
-  生效前为未知,任一成员下降为异常,否则任一成员未知为未知;成员切换不
-  重置各设备原读数区间的分摊起点。仅全天有效覆盖的日期可判定,消耗严格
-  大于阈值才超限(等于为正常),零增长有效;有未知或下降覆盖的日期不可
-  判定,不触发也不恢复。每个规则每个日期独立跟踪:首次超限创建带全局
-  唯一标识的未确认告警,重复超限保留原标识;完整评估正常才记录恢复;恢复
-  后再超限创建新的未确认告警,旧记录保留,原确认不转移。批量日期评估要么
-  全部提交要么不提交。
+  阈值非负、最多三位小数 kWh;目标、阈值与时区创建后固定,分组规则绑定分组
+  标识、不冻结创建时成员。--tz 可选,接受运行环境支持的 IANA 时区名(如
+  Asia/Shanghai、America/New_York),省略为 UTC(与显式 UTC 等价);时区按
+  运行环境解析后的规范名存储与比较,未知时区名为参数错误,返回 2。相同标识、
+  同目标类型、同目标标识、等价阈值及同时区重试成功且不重复创建,任一不同
+  即报冲突。
+  evaluate 与 alerts 的 --from/--to 为 YYYY-MM-DD 的当地日期(按规则时区
+  解释),起日含、止日不含,起日必须更早。每个日期统计归属该日期的全部实际
+  UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨重复小时完整
+  计入,日期回退的不连续时段合并为同一天、一次评估只作一次判定;整日被跳过
+  的日期标明跳过,不判定、不创建也不恢复告警。设备规则评估口径与 daily 相同;
+  分组规则与 group daily 的联合覆盖口径相同:每天按当时生效的成员版本计算,
+  允许日内切换,首个版本生效前为未知,任一成员下降为异常,否则任一成员未知
+  为未知;成员切换不重置各设备原读数区间的分摊起点。仅全天有效覆盖的日期
+  可判定,消耗严格大于阈值才超限(等于为正常),零增长有效;有未知或下降
+  覆盖的日期不可判定,不触发也不恢复。每个规则每个日期独立跟踪:首次超限
+  创建带全局唯一标识的未确认告警,重复超限保留原标识;完整评估正常才记录
+  恢复;恢复后再超限创建新的未确认告警,旧记录保留,原确认不转移。批量日期
+  评估要么全部提交要么不提交。
   ack 按告警标识确认,已恢复告警也可确认;重复确认成功且不重复记事,确认
-  不改变超限或恢复状态。alerts 按规则和日期展示当前计算的消耗或不可判定
-  原因、各次告警的标识、检测状态、确认状态及按发生顺序排列的触发/恢复/
-  确认事件(触发、恢复时的消耗为当时记录,不随后续数据改写);省略日期
-  范围时展示有告警记录的全部日期;查询只读,不会隐式恢复。导入读数或补录
-  成员版本都不自动评估,需显式重评才更新检测状态。
+  不改变超限或恢复状态。alerts 按规则和当地日期升序展示当前计算的消耗或不
+  可判定原因、实际 UTC 时段及有效/异常/未知秒数、各次告警的标识、检测状态、
+  确认状态及按发生顺序排列的触发/恢复/确认事件(触发、恢复时的消耗为当时
+  记录,不随后续数据改写);省略日期范围时展示有告警记录的全部日期;查询
+  只读,不会隐式恢复。导入读数或补录成员版本都不自动评估,需显式重评才更新
+  检测状态。规则时区与历史重启后保留;没有时区的旧规则按 UTC 使用,原告警
+  标识、日期、状态和事件顺序保留。
 
 CSV 格式:
   表头: ${CSV_HEADER}
@@ -264,11 +272,13 @@ function oneFlag(flags: Map<string, string[]>, name: string): string | null {
   return list[0];
 }
 
-/** 解析 YYYY-MM-DD 日期选项;无效时返回错误消息字符串。 */
-function dateFlag(value: string, label: string): number | string {
-  const ts = parseUtcDate(value.trim());
-  if (ts === null) return `${label}无效: '${value.trim()}'(需 YYYY-MM-DD 的真实 UTC 日期)`;
-  return ts;
+/** 解析 YYYY-MM-DD 日期选项为当地日期标签;无效时返回错误消息字符串。 */
+function dateFlag(value: string, label: string): { date: string } | string {
+  const v = value.trim();
+  if (parseUtcDate(v) === null) {
+    return `${label}无效: '${v}'(需 YYYY-MM-DD 的真实日期)`;
+  }
+  return { date: v };
 }
 
 function cmdRule(rest: string[]): number {
@@ -278,14 +288,18 @@ function cmdRule(rest: string[]): number {
     return cmdRuleList();
   }
   if (sub === 'create') {
-    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold']);
+    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold', '--tz']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
     const deviceList = flags.get('--device');
     const groupList = flags.get('--group');
     const thresholdRaw = oneFlag(flags, '--threshold');
+    const tzList = flags.get('--tz');
     if (idRaw === null || thresholdRaw === null) {
       return usageError("'rule create' 需要 --id 与 --threshold 各恰好一个");
+    }
+    if (tzList !== undefined && tzList.length !== 1) {
+      return usageError("'rule create' 的 --tz 只能出现一次");
     }
     const hasDevice = deviceList !== undefined;
     const hasGroup = groupList !== undefined;
@@ -302,14 +316,25 @@ function cmdRule(rest: string[]): number {
     if (thresholdMilli === null) {
       return usageError(`阈值无效: '${thresholdRaw.trim()}'(需非负、最多三位小数的 kWh)`);
     }
+    // 时区省略与显式 UTC 等价;按运行环境解析后的规范名存储与比较。
+    let tz = 'UTC';
+    if (tzList !== undefined) {
+      const tzRaw = tzList[0].trim();
+      if (tzRaw === '') return usageError("'--tz' 的值不能为空");
+      const canonical = canonicalTimezone(tzRaw);
+      if (canonical === null) {
+        return usageError(`未知时区 '${tzRaw}'(需运行环境支持的 IANA 时区名,如 Asia/Shanghai、America/New_York)`);
+      }
+      tz = canonical;
+    }
     if (hasDevice) {
       const device = (deviceList as string[])[0].trim();
       if (device === '') return usageError("'--device' 的值不能为空");
-      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli });
+      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli, tz });
     }
     const group = (groupList as string[])[0].trim();
     if (group === '') return usageError("'--group' 的值不能为空");
-    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli });
+    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli, tz });
   }
   if (sub === undefined) return usageError("'rule' 需要子命令 create 或 list");
   return usageError(`无法识别的 rule 子命令 '${sub}'`);
@@ -330,8 +355,8 @@ function cmdEvaluateEntry(rest: string[]): number {
   if (typeof from === 'string') return usageError(from);
   const to = dateFlag(toRaw, '结束日期');
   if (typeof to === 'string') return usageError(to);
-  if (from >= to) return usageError('评估起日必须早于止日(--from < --to)');
-  return cmdEvaluate({ ruleId, from, to });
+  if (from.date >= to.date) return usageError('评估起日必须早于止日(--from < --to)');
+  return cmdEvaluate({ ruleId, from: from.date, to: to.date });
 }
 
 function cmdAlertsEntry(rest: string[]): number {
@@ -346,8 +371,8 @@ function cmdAlertsEntry(rest: string[]): number {
   if ((fromList !== undefined) !== (toList !== undefined)) {
     return usageError("'alerts' 的 --from 与 --to 需同时提供或同时省略");
   }
-  let from: number | undefined;
-  let to: number | undefined;
+  let from: string | undefined;
+  let to: string | undefined;
   if (fromList !== undefined) {
     const fromRaw = oneFlag(flags, '--from');
     const toRaw = oneFlag(flags, '--to');
@@ -358,9 +383,9 @@ function cmdAlertsEntry(rest: string[]): number {
     if (typeof fromParsed === 'string') return usageError(fromParsed);
     const toParsed = dateFlag(toRaw, '结束日期');
     if (typeof toParsed === 'string') return usageError(toParsed);
-    if (fromParsed >= toParsed) return usageError('查询起日必须早于止日(--from < --to)');
-    from = fromParsed;
-    to = toParsed;
+    if (fromParsed.date >= toParsed.date) return usageError('查询起日必须早于止日(--from < --to)');
+    from = fromParsed.date;
+    to = toParsed.date;
   }
   return cmdAlerts({ ruleId, from, to });
 }

@@ -5,6 +5,8 @@
 // 时段出现时合并统计、时段分别保留;整日被跳过的当地日期没有实际时段,
 // 不生成虚构日报。
 
+import { formatIsoUtc, parseUtcDate } from './time.ts';
+
 export interface LocalDayPeriod {
   /** 时段起点(含),epoch 秒。 */
   start: number;
@@ -49,6 +51,18 @@ export function loadTimezone(name: string): Intl.DateTimeFormat | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 把时区名解析为运行环境解析后的规范 IANA 名称(如 US/Eastern 解析为
+ * America/New_York);运行环境不支持时返回 null。同一实际时区的不同写法
+ * 解析为同一规范名,规则时区按规范名存储与比较。
+ */
+export function canonicalTimezone(name: string): string | null {
+  const fmt = loadTimezone(name);
+  if (fmt === null) return null;
+  const resolved = fmt.resolvedOptions().timeZone;
+  return typeof resolved === 'string' && resolved !== '' ? resolved : null;
 }
 
 /** 年月日时分秒按 UTC 解释的 epoch 秒(setUTCFullYear 以支持 0-99 年)。 */
@@ -159,4 +173,39 @@ export function localDays(fmt: Intl.DateTimeFormat, from: number, to: number): L
     cursor = end;
   }
   return days;
+}
+
+export interface LocalDateEntry {
+  /** 当地日期标签,YYYY-MM-DD,按当地日期升序。 */
+  label: string;
+  /** 归属该日期的全部实际 UTC 时段;null 表示整日被跳过(无实际时段)。 */
+  day: LocalDay | null;
+}
+
+/**
+ * 把连续日历日期范围 [fromLabel, toLabel)(YYYY-MM-DD,起日含、止日不含)映射为
+ * 各当地日期在 fmt 时区下的实际 UTC 时段。每个日期统计归属该日期的全部实际
+ * 时段,不把当地午夜简单套用固定偏移:夏令时短日的实际时段更短,回拨日更长,
+ * 日期回退产生的不连续时段合并在同一日期下;整日被跳过的日期 day 为 null,
+ * 由调用方标明跳过。日历日期本身按格里历逐日递增,与时区无关。
+ */
+export function localDateRange(
+  fmt: Intl.DateTimeFormat,
+  fromLabel: string,
+  toLabel: string,
+): LocalDateEntry[] {
+  const fromUtc = parseUtcDate(fromLabel) as number;
+  const toUtc = parseUtcDate(toLabel) as number;
+  // 任一日期的当地午夜与 UTC 午夜之差不超过该时区的最大偏移(远小于两天),
+  // 向两侧放宽后再切分,保证首尾日期的实际时段完整落入切分范围。
+  const margin = 2 * 86400;
+  const days = localDays(fmt, fromUtc - margin, toUtc + margin);
+  const byLabel = new Map<string, LocalDay>();
+  for (const d of days) byLabel.set(d.label, d);
+  const out: LocalDateEntry[] = [];
+  for (let t = fromUtc; t < toUtc; t += 86400) {
+    const label = formatIsoUtc(t).slice(0, 10);
+    out.push({ label, day: byLabel.get(label) ?? null });
+  }
+  return out;
 }
