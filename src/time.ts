@@ -51,6 +51,14 @@ export function parseUtcDate(input: string): number | null {
   return parseIso8601(`${input}T00:00:00Z`);
 }
 
+/**
+ * 校验 YYYY-MM-DD 为真实日历日期(仅按字面年月日,不绑定任何时区)。
+ * 用于按规则时区解释的当地日期:标签本身不换算成固定 UTC 时刻。
+ */
+export function isValidDateLabel(input: string): boolean {
+  return parseUtcDate(input) !== null;
+}
+
 /** 格式化为 UTC 的秒精度 ISO8601(带 Z)。 */
 export function formatIsoUtc(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString().replace(/\.000Z$/, 'Z');

@@ -6,23 +6,32 @@
 //   版本计算,允许日内切换)。
 // 设备与分组即使同名也是不同目标;规则标识在两类规则间统一唯一(去首尾空白、
 // 区分大小写)。阈值为非负、最多三位小数的 kWh,绑定目标与阈值创建后固定。
-// 相同标识、同目标类型、同目标标识及等价阈值重试成功且不重复创建,异参报冲突。
+// 每条规则带固定的评估时区 tz(运行环境解析后的 IANA 规范名):rule create 以
+// 可选 --tz 给出,省略与显式 UTC 等价,创建后固定。相同标识、同目标类型、
+// 同目标标识、等价阈值及等价时区重试成功且不重复创建,任一不同即报冲突。
 //
-// - 评估针对连续完整 UTC 日期(起日含、止日不含)。设备规则复用 daily 的完整
-//   时序、均匀分摊与累计比例向下取整口径;分组规则复用 group daily 的联合覆盖
-//   口径:每天按当时生效的成员版本切分时段(允许日内切换),任一成员下降为异常,
-//   否则任一成员未知为未知,首个版本生效前为未知;成员切换不重置各设备原读数
-//   区间的分摊起点。仅全天有效覆盖的日期可判定,消耗严格大于阈值才超限,等于
-//   阈值视为正常;有未知或下降覆盖时不可判定,不触发也不恢复;零增长是有效数据。
-// - 每条规则的每个日期独立跟踪:首次判定超限创建全局唯一标识的未确认告警,
-//   重复超限保留原标识且不新增事件;后续完整评估正常才记录恢复;恢复后再
-//   超限创建新的未确认告警,旧记录保留,原确认不转移给新告警。
+// - evaluate/alerts 的 --from/--to 为 YYYY-MM-DD,按所选规则时区的当地日期
+//   解释:起日含、止日不含,起日必须更早。每个日期统计归属该日期的全部实际
+//   UTC 时段(由 tz.ts 按真实墙钟切出,不把当地午夜套用固定偏移):夏令时
+//   短日不补未知,重复小时完整计入;日期回退产生的不连续时段合并为同一天,
+//   一次评估只作一次判定;整日被跳过时标明 SKIPPED,不判定、不创建或恢复
+//   告警。设备规则复用 daily 的完整时序、均匀分摊与累计比例向下取整口径;
+//   分组规则复用 group daily 的联合覆盖口径:每天按当时生效的成员版本切分
+//   时段(允许日内切换),任一成员下降为异常,否则任一成员未知为未知,首个
+//   版本生效前为未知;成员切换不重置各设备原读数区间的分摊起点。仅全天
+//   (全部实际时段)有效覆盖的日期可判定,消耗严格大于阈值才超限,等于阈值
+//   视为正常;有未知或下降覆盖时不可判定,不触发也不恢复;零增长是有效数据。
+// - 每条规则的每个当地日期独立跟踪:首次判定超限创建全局唯一标识的未确认
+//   告警,重复超限保留原标识且不新增事件;后续完整评估正常才记录恢复;恢复
+//   后再超限创建新的未确认告警,旧记录保留,原确认不转移给新告警。
 // - 确认按告警标识,已恢复告警也可确认;重复确认成功且不重复记事;确认不
 //   改变超限或恢复状态。
 // - 规则与历史存于数据目录的 alerts.json(与 readings.json、groups.json 相互
-//   独立,导入与补录成员版本都不会自动评估)。创建、评估、确认都先在内存完成
-//   全部计算再一次性原子写入,任何失败不留下部分状态;损坏或不可读存储明确
-//   报错,绝不当作空库。旧版仅含 device 字段的规则无需手工转换即可继续使用。
+//   独立,导入、补录成员版本、修正和撤销都不会自动评估)。创建、评估、确认
+//   都先在内存完成全部计算再一次性原子写入,任何失败不留下部分状态;损坏或
+//   不可读存储明确报错,绝不当作空库;存储内非法时区不能回退为 UTC。旧版
+//   仅含 device 字段、无时区字段的规则按 UTC 读入,原告警标识、日期、状态与
+//   事件顺序无需手工转换即可继续使用。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -35,9 +44,16 @@ import {
   StoreError,
   type Reading,
 } from './store.ts';
-import { computeDay, DAY_SECONDS, type DayStats } from './report.ts';
-import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group } from './groups.ts';
-import { formatIsoUtc, parseIso8601 } from './time.ts';
+import { computeDay, type DayStats } from './report.ts';
+import {
+  computeGroupSegment,
+  loadCheckedSeriesByDevice,
+  loadGroups,
+  type Group,
+  type GroupPeriod,
+} from './groups.ts';
+import { formatIsoUtc } from './time.ts';
+import { canonicalTimezone, loadTimezone, localDaysForLabels, type LocalDay } from './tz.ts';
 import { formatKwh } from './value.ts';
 
 export type RuleTargetType = 'device' | 'group';
@@ -51,6 +67,8 @@ export interface AlertRule {
   targetId: string;
   /** 阈值,毫千瓦时 BigInt,创建后固定。 */
   thresholdMilli: bigint;
+  /** 评估时区的 IANA 规范名(运行环境解析后),创建后固定;旧规则缺失按 UTC。 */
+  tz: string;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -67,7 +85,7 @@ export interface AlertRecord {
   /** 告警标识,全局唯一(设备与分组规则共用编号空间)。 */
   id: string;
   ruleId: string;
-  /** UTC 日期,YYYY-MM-DD。 */
+  /** 规则时区下的当地日期,YYYY-MM-DD。 */
   date: string;
   /** 检测状态:triggered 超限未恢复;recovered 已恢复。 */
   status: 'triggered' | 'recovered';
@@ -158,7 +176,23 @@ function loadAlertState(path: string): AlertState {
     }
     if (ruleIds.has(r.id)) throw bad(`duplicate rule id '${r.id}'`);
     ruleIds.add(r.id);
-    rules.push({ id: r.id, targetType, targetId, thresholdMilli: thresholdMilli as bigint });
+    // 评估时区:字段缺失(旧版规则)按 UTC 使用;字段存在但不是运行环境
+    // 支持的 IANA 名(或非字符串、空串)按损坏拒绝,不能回退为 UTC。
+    // 重新取规范名以归并别名,保证与创建时口径一致。
+    let tz = 'UTC';
+    if (r.tz !== undefined) {
+      if (typeof r.tz !== 'string' || r.tz.length === 0) throw bad(`invalid tz in rule '${r.id}'`);
+      const canonical = canonicalTimezone(r.tz);
+      if (canonical === null) throw bad(`unknown tz '${r.tz}' in rule '${r.id}'`);
+      tz = canonical;
+    }
+    rules.push({
+      id: r.id,
+      targetType,
+      targetId,
+      thresholdMilli: thresholdMilli as bigint,
+      tz,
+    });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -213,13 +247,14 @@ function saveAlertState(path: string, state: AlertState): void {
   const body =
     JSON.stringify(
       {
-        version: 2,
+        version: 3,
         ...state,
         rules: state.rules.map((r) => ({
           id: r.id,
           targetType: r.targetType,
           targetId: r.targetId,
           thresholdMilli: r.thresholdMilli.toString(),
+          tz: r.tz,
         })),
       },
       null,
@@ -288,33 +323,115 @@ function undecidableReason(stats: Pick<DayStats, 'unknown' | 'anomaly'>): string
   return `undecidable (unknown=${stats.unknown}s anomaly=${stats.anomaly}s)`;
 }
 
-/**
- * 计算规则在完整 UTC 日 [dayStart, dayStart+86400) 上的统计。
- * 设备规则用 daily 口径,分组规则用 group daily 的联合覆盖口径。
- */
-function computeRuleDay(rule: AlertRule, env: RuleEnv, dayStart: number): DayStats {
-  const dayEnd = dayStart + DAY_SECONDS;
-  if (env.kind === 'device') {
-    return computeDay(env.series, dayStart, dayEnd);
-  }
-  const stats = computeGroupSegment(env.group.versions, env.byDevice, dayStart, dayEnd);
-  return {
-    valid: stats.valid,
-    anomaly: stats.anomaly,
-    unknown: stats.unknown,
-    consumption: stats.consumption,
-  };
+/** 一个实际 UTC 时段的统计与(分组规则的)成员版本时段。 */
+interface RulePeriodStats extends DayStats {
+  start: number;
+  end: number;
+  memberPeriods?: GroupPeriod[];
+}
+
+/** 一个当地日期(其全部实际 UTC 时段)的聚合统计。 */
+interface RuleDayStats extends DayStats {
+  periods: RulePeriodStats[];
 }
 
 /**
- * 创建规则。相同标识、同目标类型、同目标标识及等价阈值重试成功且不重复创建;
- * 任一不同即报冲突。设备必须已有存储读数;分组必须已配置。返回进程退出码。
+ * 计算规则在一个当地日期上的统计:把该日期的全部实际 UTC 时段(由 tz.ts
+ * 按真实墙钟归属切出,可能因日期回退而不连续)分别计算后聚合。
+ * 设备规则用 daily 口径,分组规则用 group daily 的联合覆盖口径。
+ * 各设备片段仍取原读数区间起点累计比例向下取整的两端差,日界线与成员
+ * 切换不重置起点(区间始终取自完整时序)。
+ */
+function computeRuleLocalDay(rule: AlertRule, env: RuleEnv, day: LocalDay): RuleDayStats {
+  let valid = 0;
+  let anomaly = 0;
+  let unknown = 0;
+  let consumption = 0n;
+  const periods: RulePeriodStats[] = [];
+  for (const p of day.periods) {
+    if (env.kind === 'device') {
+      const s = computeDay(env.series, p.start, p.end);
+      valid += s.valid;
+      anomaly += s.anomaly;
+      unknown += s.unknown;
+      consumption += s.consumption;
+      periods.push({ ...s, start: p.start, end: p.end });
+    } else {
+      const s = computeGroupSegment(env.group.versions, env.byDevice, p.start, p.end);
+      valid += s.valid;
+      anomaly += s.anomaly;
+      unknown += s.unknown;
+      consumption += s.consumption;
+      periods.push({
+        ...s,
+        start: p.start,
+        end: p.end,
+        memberPeriods: s.periods,
+      });
+    }
+  }
+  return { valid, anomaly, unknown, consumption, periods };
+}
+
+/** 加载规则时区的墙钟格式化器;存储内非法时区已在加载存储时拒绝,此处防御。 */
+function ruleTimezone(rule: AlertRule): Intl.DateTimeFormat {
+  const fmt = loadTimezone(rule.tz);
+  if (fmt === null) {
+    throw new StoreError(`storage file ${alertFilePath()} is corrupted (unknown tz '${rule.tz}')`);
+  }
+  return fmt;
+}
+
+/** 标签加一天(按公历),返回次日的 YYYY-MM-DD;调用方保证输入为真实日期。 */
+function nextLabel(label: string): string {
+  const [y, mo, d] = label.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, mo - 1, d + 1));
+  return (
+    `${String(dt.getUTCFullYear()).padStart(4, '0')}-` +
+    `${String(dt.getUTCMonth() + 1).padStart(2, '0')}-` +
+    `${String(dt.getUTCDate()).padStart(2, '0')}`
+  );
+}
+
+/** 枚举两个当地日期标签之间的日历日(起含止不含),按标签升序。 */
+function enumerateLabels(fromLabel: string, toLabel: string): string[] {
+  const labels: string[] = [];
+  for (let label = fromLabel; label < toLabel; label = nextLabel(label)) {
+    labels.push(label);
+  }
+  return labels;
+}
+
+/** 输出一个当地日期的实际 UTC 时段及有效/异常/未知秒数(时段按实际时刻)。 */
+function printDayPeriods(rule: AlertRule, stats: RuleDayStats): void {
+  for (const p of stats.periods) {
+    console.log(
+      `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}` +
+        `  valid=${p.valid}s  anomaly=${p.anomaly}s  unknown=${p.unknown}s`,
+    );
+    if (rule.targetType === 'group' && p.memberPeriods) {
+      for (const mp of p.memberPeriods) {
+        const members = mp.members === null ? '(no version in effect)' : mp.members.join(',');
+        console.log(
+          `      members=${members}  period=${formatIsoUtc(mp.start)}..${formatIsoUtc(mp.end)}`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * 创建规则。相同标识、同目标类型、同目标标识、等价阈值及等价时区重试成功
+ * 且不重复创建;任一不同即报冲突。设备必须已有存储读数;分组必须已配置。
+ * tz 为运行环境解析后的规范时区名(省略与显式 UTC 等价,由调用方归并)。
+ * 返回进程退出码。
  */
 export function cmdRuleCreate(opts: {
   id: string;
   targetType: RuleTargetType;
   targetId: string;
   thresholdMilli: bigint;
+  tz: string;
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -334,18 +451,20 @@ export function cmdRuleCreate(opts: {
     if (
       existing.targetType === opts.targetType &&
       existing.targetId === opts.targetId &&
-      existing.thresholdMilli === opts.thresholdMilli
+      existing.thresholdMilli === opts.thresholdMilli &&
+      existing.tz === opts.tz
     ) {
       console.log(
         `rule '${opts.id}' already exists with identical parameters (${targetLabel(existing)} ` +
-          `threshold=${formatKwh(existing.thresholdMilli)} kWh); unchanged`,
+          `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz}); unchanged`,
       );
       return 0;
     }
     err(
       `rule '${opts.id}' already exists with different parameters ` +
-        `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh, ` +
-        `got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh); conflict`,
+        `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh ` +
+        `tz=${existing.tz}, got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
+        `tz=${opts.tz}); conflict`,
     );
     return 1;
   }
@@ -378,6 +497,7 @@ export function cmdRuleCreate(opts: {
     targetType: opts.targetType,
     targetId: opts.targetId,
     thresholdMilli: opts.thresholdMilli,
+    tz: opts.tz,
   });
   try {
     saveAlertState(statePath, state);
@@ -389,7 +509,7 @@ export function cmdRuleCreate(opts: {
     throw e;
   }
   console.log(
-    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh`,
+    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh tz=${opts.tz}`,
   );
   return 0;
 }
@@ -414,22 +534,24 @@ export function cmdRuleList(): number {
   for (const r of rules) {
     const open = state.alerts.filter((a) => a.ruleId === r.id && a.status === 'triggered').length;
     console.log(
-      `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  open alerts=${open}`,
+      `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  tz=${r.tz}  open alerts=${open}`,
     );
   }
   return 0;
 }
 
 /**
- * 评估规则在连续完整 UTC 日期范围 [from, to) 上的超限情况。
+ * 评估规则在连续当地日期范围 [fromLabel, toLabel) 上的超限情况(起日含、
+ * 止日不含)。日期按规则时区解释,逐日统计归属该日期的全部实际 UTC 时段。
  * 全部日期计算并应用到内存状态后一次性原子写入,不部分提交;中途任一存储
  * 或数据错误都在写入前抛出,操作前状态保留。返回进程退出码。
  */
-export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }): number {
+export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }): number {
   const statePath = alertFilePath();
   let state: AlertState;
   let rule: AlertRule;
   let env: RuleEnv;
+  let fmt: Intl.DateTimeFormat;
   try {
     state = loadAlertState(statePath);
     const found = state.rules.find((r) => r.id === opts.ruleId);
@@ -439,6 +561,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
     }
     rule = found;
     env = prepareEnv(rule);
+    fmt = ruleTimezone(rule);
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -451,14 +574,31 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
   // 碰撞,这里再显式防御,碰撞则整体中止且不写入)。
   const alertIds = new Set(state.alerts.map((a) => a.id));
 
+  const labels = enumerateLabels(opts.from, opts.to);
+  // 每个标签对应其全部实际 UTC 时段;整日被跳过(夏令时前拨整天不存在)的
+  // 标签不在 Map 中。
+  const daysByLabel = localDaysForLabels(fmt, opts.from, opts.to);
+
   const threshold = rule.thresholdMilli;
   const lines: string[] = [];
-  for (let dayStart = opts.from; dayStart < opts.to; dayStart += DAY_SECONDS) {
-    const date = formatIsoUtc(dayStart).slice(0, 10);
-    const stats = computeRuleDay(rule, env, dayStart);
+  for (const date of labels) {
+    const day = daysByLabel.get(date);
+    if (day === undefined) {
+      // 整日被跳过:不判定、不创建或恢复告警,一次评估只输出一行。
+      lines.push(`  ${date}  SKIPPED (no actual time in this local date)  no alert action`);
+      continue;
+    }
+    const stats = computeRuleLocalDay(rule, env, day);
+    // 不连续时段合并为同一天,一次评估只作一次判定。
     if (stats.unknown > 0 || stats.anomaly > 0) {
       // 有未知或下降覆盖:不可判定,不触发也不恢复。
       lines.push(`  ${date}  ${undecidableReason(stats)}  no alert action`);
+      for (const p of stats.periods) {
+        lines.push(
+          `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}` +
+            `  valid=${p.valid}s  anomaly=${p.anomaly}s  unknown=${p.unknown}s`,
+        );
+      }
       continue;
     }
     const exceeded = stats.consumption > threshold;
@@ -504,6 +644,12 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
         lines.push(`  ${date}  ${cmp}  NORMAL  no alert`);
       }
     }
+    for (const p of stats.periods) {
+      lines.push(
+        `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}` +
+          `  valid=${p.valid}s  anomaly=${p.anomaly}s  unknown=${p.unknown}s`,
+      );
+    }
   }
 
   try {
@@ -517,7 +663,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
   );
   for (const line of lines) console.log(line);
   return 0;
@@ -525,14 +671,17 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
 
 /**
  * 查询规则的告警历史。只读,不修改数据,也不会隐式恢复。
- * 给定日期范围时逐日展示当前计算的消耗或不可判定原因及各次告警;省略范围时
- * 展示有告警记录的全部日期。触发/恢复事件中的消耗为评估当时记录,不随后续
- * 数据变化改写。返回进程退出码。
+ * 给定日期范围时逐日(规则时区的当地日期,起含止不含)展示当前计算的消耗
+ * 或不可判定原因及各次告警,并列出每个当地日期的实际 UTC 时段与有效/异常/
+ * 未知秒数(时段按实际时刻排序);省略范围时展示有告警记录的全部日期(按
+ * 当地日期升序)。触发/恢复事件中的消耗为评估当时记录,不随后续数据变化
+ * 改写。返回进程退出码。
  */
-export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }): number {
+export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }): number {
   let state: AlertState;
   let rule: AlertRule;
   let env: RuleEnv;
+  let fmt: Intl.DateTimeFormat;
   try {
     state = loadAlertState(alertFilePath());
     const found = state.rules.find((r) => r.id === opts.ruleId);
@@ -542,6 +691,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
     }
     rule = found;
     env = prepareEnv(rule);
+    fmt = ruleTimezone(rule);
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -550,37 +700,45 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
     throw e;
   }
 
-  let dayStarts: number[];
+  let labels: string[];
   if (opts.from !== undefined && opts.to !== undefined) {
-    dayStarts = [];
-    for (let d = opts.from; d < opts.to; d += DAY_SECONDS) dayStarts.push(d);
+    labels = enumerateLabels(opts.from, opts.to);
   } else {
-    const dates = [
+    labels = [
       ...new Set(state.alerts.filter((a) => a.ruleId === rule.id).map((a) => a.date)),
     ].sort();
-    dayStarts = dates.map((d) => parseIso8601(`${d}T00:00:00Z`) as number);
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
   );
-  if (dayStarts.length === 0) {
+  if (labels.length === 0) {
     console.log(`  no alerts recorded for rule '${rule.id}'`);
     return 0;
   }
 
+  // 覆盖全部待展示当地日期的实际 UTC 时段(省略范围时只需告警日期所在窗口)。
+  const spanStart = labels[0];
+  const spanEnd = nextLabel(labels[labels.length - 1]);
+  const daysByLabel = localDaysForLabels(fmt, spanStart, spanEnd);
+
   const threshold = rule.thresholdMilli;
-  for (const dayStart of dayStarts) {
-    const date = formatIsoUtc(dayStart).slice(0, 10);
-    const stats = computeRuleDay(rule, env, dayStart);
-    if (stats.unknown > 0 || stats.anomaly > 0) {
-      console.log(`  ${date}  ${undecidableReason(stats)}`);
+  for (const date of labels) {
+    const day = daysByLabel.get(date);
+    if (day === undefined) {
+      console.log(`  ${date}  SKIPPED (no actual time in this local date)`);
     } else {
-      const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
-      console.log(
-        `  ${date}  consumption=${formatKwh(stats.consumption)} kWh ` +
-          `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)`,
-      );
+      const stats = computeRuleLocalDay(rule, env, day);
+      if (stats.unknown > 0 || stats.anomaly > 0) {
+        console.log(`  ${date}  ${undecidableReason(stats)}`);
+      } else {
+        const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
+        console.log(
+          `  ${date}  consumption=${formatKwh(stats.consumption)} kWh ` +
+            `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)`,
+        );
+      }
+      printDayPeriods(rule, stats);
     }
     const alerts = state.alerts
       .filter((a) => a.ruleId === rule.id && a.date === date)

@@ -51,6 +51,16 @@ export function loadTimezone(name: string): Intl.DateTimeFormat | null {
   }
 }
 
+/**
+ * 校验 IANA 时区名并返回运行环境解析后的规范名称(取 resolvedOptions 的
+ * timeZone):别名(如 Etc/UTC、Zulu)归并为同一规范名(UTC),故省略与
+ * 显式 UTC 等价;运行环境不支持时返回 null。
+ */
+export function canonicalTimezone(name: string): string | null {
+  const fmt = loadTimezone(name);
+  return fmt === null ? null : fmt.resolvedOptions().timeZone;
+}
+
 /** 年月日时分秒按 UTC 解释的 epoch 秒(setUTCFullYear 以支持 0-99 年)。 */
 function naiveEpoch(y: number, mo: number, d: number, h: number, mi: number, s: number): number {
   const dt = new Date(0);
@@ -125,6 +135,48 @@ function nextTransition(fmt: Intl.DateTimeFormat, t: number, o0: number, limit: 
     lo = u;
   }
   return Infinity;
+}
+
+/** YYYY-MM-DD 标签按 UTC 分量构造的 epoch 秒;非真实日期返回 null。 */
+function labelEpoch(label: string): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(label);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(0);
+  dt.setUTCFullYear(y, mo - 1, d);
+  dt.setUTCHours(0, 0, 0, 0);
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) {
+    return null;
+  }
+  return dt.getTime() / 1000;
+}
+
+/**
+ * 枚举当地日期标签区间 [fromLabel, toLabel) 内每个有实际时段的当地日期。
+ * 不按固定偏移把当地午夜换算成 UTC:先在覆盖范围内全部可能实际时刻的 UTC
+ * 窗口上用 localDays 按真实墙钟归属(两侧各留 48 小时余量,tz 数据库中
+ * 任何偏移的绝对值都小于 24 小时,故余量必然充足),再只保留标签落在
+ * 区间内的日期。整日被跳过(没有任何实际 UTC 时段)的当地日期不出现在
+ * 返回的 Map 中,由调用方标明跳过。
+ */
+export function localDaysForLabels(
+  fmt: Intl.DateTimeFormat,
+  fromLabel: string,
+  toLabel: string,
+): Map<string, LocalDay> {
+  const fromNaive = labelEpoch(fromLabel);
+  const toNaive = labelEpoch(toLabel);
+  if (fromNaive === null || toNaive === null) throw new Error('invalid date label');
+  const margin = 2 * 86400;
+  const all = localDays(fmt, fromNaive - margin, toNaive + margin);
+  const byLabel = new Map<string, LocalDay>();
+  for (const day of all) {
+    if (day.label >= fromLabel && day.label < toLabel) byLabel.set(day.label, day);
+  }
+  return byLabel;
 }
 
 /**
