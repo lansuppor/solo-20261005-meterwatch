@@ -22,3 +22,13 @@ export function formatKwh(milli: number): string {
   const frac = String(abs % 1000).padStart(3, '0');
   return `${sign}${int}.${frac}`;
 }
+
+/**
+ * 将毫千瓦时整数(BigInt)格式化为固定三位小数的 kWh 字符串。
+ * 用于中间乘积与多区间汇总可能超出 Number 安全整数范围的场合。
+ */
+export function formatKwhBig(milli: bigint): string {
+  const sign = milli < 0n ? '-' : '';
+  const abs = milli < 0n ? -milli : milli;
+  return `${sign}${abs / 1000n}.${String(abs % 1000n).padStart(3, '0')}`;
+}

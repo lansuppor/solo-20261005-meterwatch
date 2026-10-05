@@ -2,9 +2,10 @@
 
 import { readFileSync } from 'node:fs';
 import { CsvError, parseCsv } from './csv.ts';
+import { buildDeviceReport } from './report.ts';
 import { loadStore, saveStore, StoreError, dataFilePath, type Reading } from './store.ts';
 import { formatIsoUtc, parseIso8601 } from './time.ts';
-import { formatKwh, parseKwh } from './value.ts';
+import { formatKwh, formatKwhBig, parseKwh } from './value.ts';
 
 export const CSV_HEADER = 'device,time,reading';
 
@@ -217,6 +218,83 @@ export function cmdReadings(filter: ReadingsFilter): number {
     console.log(`  summary: device=${device}  total consumption=${formatKwh(total)} kWh`);
   }
   if (!printed) console.log('no readings match');
+  return 0;
+}
+
+export interface ReportFilter {
+  devices: string[];
+  from: number;
+  to: number;
+}
+
+/**
+ * 按 UTC 自然日输出能耗日报。只读,不修改数据。
+ * 估算口径见 report.ts;同设备同一实际时刻存在多条存储记录时报错返回 1。
+ * 返回进程退出码。
+ */
+export function cmdReport(filter: ReportFilter): number {
+  const storePath = dataFilePath();
+  let all: Reading[];
+  try {
+    all = loadStore(storePath);
+  } catch (e) {
+    if (e instanceof StoreError) {
+      err(e.message);
+      return 1;
+    }
+    throw e;
+  }
+
+  const byDevice = new Map<string, Reading[]>();
+  for (const r of all) {
+    const list = byDevice.get(r.device);
+    if (list) list.push(r);
+    else byDevice.set(r.device, [r]);
+  }
+  for (const list of byDevice.values()) list.sort((a, b) => a.ts - b.ts);
+
+  const wanted =
+    filter.devices.length > 0
+      ? [...new Set(filter.devices)]
+      : [...byDevice.keys()];
+  wanted.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  let printed = false;
+  for (const device of wanted) {
+    const series = byDevice.get(device);
+    if (!series) continue;
+    for (let i = 1; i < series.length; i++) {
+      if (series[i].ts === series[i - 1].ts) {
+        err(
+          `storage error: multiple records for device '${device}' at ${formatIsoUtc(series[i].ts)}`,
+        );
+        return 1;
+      }
+    }
+    printed = true;
+
+    const report = buildDeviceReport(device, series, filter.from, filter.to);
+    console.log(`device: ${device}`);
+    for (const day of report.days) {
+      const consumption =
+        day.milli === null
+          ? 'consumption=n/a (no valid coverage)'
+          : `consumption=${formatKwhBig(day.milli)} kWh (estimated)`;
+      const incomplete =
+        day.anomalySecs > 0 || day.unknownSecs > 0 ? '  [incomplete]' : '';
+      console.log(
+        `  ${day.date}  ${consumption}  coverage: valid=${day.validSecs}s anomaly=${day.anomalySecs}s unknown=${day.unknownSecs}s${incomplete}`,
+      );
+    }
+    const total =
+      report.totalMilli === null
+        ? 'total estimated consumption=n/a (no valid coverage)'
+        : `total estimated consumption=${formatKwhBig(report.totalMilli)} kWh (computed days only)`;
+    console.log(
+      `  summary: device=${device}  ${total}${report.complete ? '' : '  report incomplete'}`,
+    );
+  }
+  if (!printed) console.log('no matching devices');
   return 0;
 }
 

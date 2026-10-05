@@ -49,3 +49,8 @@ export function parseIso8601(input: string): number | null {
 export function formatIsoUtc(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString().replace(/\.000Z$/, 'Z');
 }
+
+/** 格式化为 UTC 日期(YYYY-MM-DD)。 */
+export function formatDateUtc(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toISOString().slice(0, 10);
+}
