@@ -1,9 +1,99 @@
-const name: string = 'meterwatch';
-const args: string[] = process.argv.slice(2);
+import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
+import { parseIso8601 } from './src/time.ts';
 
-if (args.length > 0 && !(args.length === 1 && ['--help', '-h'].includes(args[0]))) {
-  console.error(name + ': unknown arguments; use --help');
-  process.exitCode = 2;
-} else {
-  console.log(name + '\n\nUsage: node app.ts [--help]\n\n建筑能耗监测与告警。当前仅提供帮助信息。');
+const name = 'meterwatch';
+
+const help = `${name}
+
+建筑能耗监测:本地累计电表读数导入与消耗核查。
+
+Usage:
+  node app.ts                       显示本帮助
+  node app.ts --help | -h           显示本帮助
+  node app.ts import <file.csv>     导入 CSV 读数(整批成功或整批拒绝)
+  node app.ts readings [筛选...]    查询读数、区间与消耗
+
+筛选(readings):
+  --device <id>     只显示指定设备(可重复使用,区分大小写)
+  --from <iso8601>  起始时刻(含),如 2026-01-01T00:00:00Z
+  --to <iso8601>    结束时刻(不含)
+  省略边界表示不限;时间必须为秒精度 ISO8601 且带 Z 或数字时区偏移
+  (如 +08:00);起点不早于终点时拒绝查询。
+
+CSV 格式:
+  表头: ${CSV_HEADER}
+  device   设备标识(区分大小写,首尾空白忽略,去空白后不能为空)
+  time     秒精度 ISO8601,带 Z 或数字时区偏移;必须是真实日期
+  reading  累计电表读数(kWh,非负,最多三位小数)
+  支持标准双引号字段与 "" 转义;同一设备同一时刻(按实际时刻判定)
+  重复且数值相同记为重复跳过,数值不同视为冲突并拒绝整批。
+
+数据位置:
+  $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json)
+
+退出码: 0 成功;1 数据或读写错误;2 参数错误`;
+
+function usageError(message: string): number {
+  console.error(`${name}: ${message}`);
+  console.error(`用法见 'node app.ts --help'`);
+  return 2;
 }
+
+function main(args: string[]): number {
+  if (args.length === 0) {
+    console.log(help);
+    return 0;
+  }
+  const [cmd, ...rest] = args;
+  if (rest.length === 0 && (cmd === '--help' || cmd === '-h')) {
+    console.log(help);
+    return 0;
+  }
+
+  if (cmd === 'import') {
+    if (rest.length !== 1) return usageError("'import' 需要且仅需要一个 CSV 文件路径");
+    return cmdImport(rest[0]);
+  }
+
+  if (cmd === 'readings') {
+    const devices: string[] = [];
+    let from: number | undefined;
+    let to: number | undefined;
+    for (let i = 0; i < rest.length; i++) {
+      let opt = rest[i];
+      let value: string | undefined;
+      const eq = opt.indexOf('=');
+      if (opt.startsWith('--') && eq !== -1) {
+        value = opt.slice(eq + 1);
+        opt = opt.slice(0, eq);
+      } else if (opt.startsWith('--')) {
+        value = rest[i + 1];
+        if (value === undefined) return usageError(`选项 '${opt}' 缺少值`);
+        i++;
+      } else {
+        return usageError(`无法识别的参数 '${opt}'`);
+      }
+      if (opt === '--device') {
+        if (value.trim() === '') return usageError("'--device' 的值不能为空");
+        devices.push(value);
+      } else if (opt === '--from' || opt === '--to') {
+        const ts = parseIso8601(value.trim());
+        if (ts === null) {
+          return usageError(`选项 '${opt}' 的时间无效: '${value}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`);
+        }
+        if (opt === '--from') from = ts;
+        else to = ts;
+      } else {
+        return usageError(`无法识别的选项 '${opt}'`);
+      }
+    }
+    if (from !== undefined && to !== undefined && from >= to) {
+      return usageError('查询起点必须早于终点(--from < --to)');
+    }
+    return cmdReadings({ devices, from, to });
+  }
+
+  return usageError(`无法识别的参数 '${cmd}'`);
+}
+
+process.exitCode = main(process.argv.slice(2));
