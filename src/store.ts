@@ -17,9 +17,12 @@ export interface Reading {
 
 export class StoreError extends Error {}
 
+export function dataDir(): string {
+  return process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
+}
+
 export function dataFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'readings.json');
+  return join(dataDir(), 'readings.json');
 }
 
 /** 读取存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */

@@ -16,6 +16,14 @@ node app.ts daily \
   --from 2026-01-01T00:00:00Z --to 2026-02-01T00:00:00Z   # 按 UTC 自然日的能耗日报
 node app.ts daily --device meter-1 --device meter-2 \
   --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z   # 只统计指定设备
+
+# 每日能耗阈值告警
+node app.ts rules                                        # 列出全部规则
+node app.ts rule create peak-day --device meter-1 --threshold 15
+node app.ts evaluate --rule peak-day --from 2026-01-01 --to 2026-02-01
+node app.ts alerts --rule peak-day                       # 评估与告警历史(只读)
+node app.ts alerts --rule peak-day --from 2026-01-10 --to 2026-01-20
+node app.ts ack alert-1                                  # 确认告警
 ```
 
 ## CSV 格式
@@ -61,9 +69,44 @@ node app.ts daily --device meter-1 --device meter-2 \
 时消耗显示无法计算,有效零增长显示零;每台设备汇总已计算的每日消耗。
 同设备同一实际时刻存在多条存储记录时报错并返回 1。
 
+## 每日能耗阈值告警
+
+`rule create` 创建规则:标识非空唯一(去首尾空白),绑定一个已有设备
+(去首尾空白、区分大小写)与非负、最多三位小数的 kWh 阈值;创建后设备
+与阈值固定。相同标识且参数等价的重试成功且不重复创建;同标识异参报
+冲突并返回 1。
+
+`evaluate --rule <id> --from <日期> --to <日期>` 评估规则在连续完整
+UTC 日期范围内的每日超限(起日含、止日不含,起日必须更早,日期格式
+YYYY-MM-DD):
+
+- 每日消耗与覆盖沿用 daily 口径;仅全天有效覆盖(无未知、无下降)的
+  日期可判定,消耗严格大于阈值才超限,等于阈值视为正常,零增长是有效
+  数据;有未知或下降覆盖的日期不可判定,不触发也不恢复告警
+- 每个(规则,日期)独立跟踪:首次超限创建带唯一标识的未确认告警;
+  重复超限保留原告警标识且不新增事件;后续完整评估正常才记录恢复;
+  恢复后再超限创建新的未确认告警,旧记录(含确认)保留,确认不转移
+  给新告警
+- 导入不自动评估;补导后需显式重评才反映新的相邻区间
+- 批量日期评估要么全部提交,要么全部不提交;任一步失败保留操作前
+  全部状态
+
+`alerts --rule <id> [--from <日期>] [--to <日期>]` 只读查询:按日期
+展示消耗或不可判定原因,以及各次告警的标识、检测状态
+(triggered/recovered)、确认状态与触发、恢复、确认的处理顺序。
+
+`ack <告警标识>` 确认告警:已恢复的告警也可确认;重复确认成功且不
+重复记事;确认不改变超限或恢复状态。
+
 ## 数据位置
 
-`$METERWATCH_DATA_DIR/readings.json`,默认 `~/.meterwatch/readings.json`。
-退出后再次启动仍可查询。
+`$METERWATCH_DATA_DIR`(默认 `~/.meterwatch`)下:
+
+- `readings.json`:读数
+- `rules.json`:告警规则
+- `alerts.json`:评估结果与告警历史
+
+退出后再次启动仍可查询。损坏或不可读的存储、重复读数身份、未知规则
+或告警都会明确报错,不会当作空库。
 
 退出码:0 成功;1 数据或读写错误;2 参数错误。

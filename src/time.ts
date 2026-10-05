@@ -49,3 +49,31 @@ export function parseIso8601(input: string): number | null {
 export function formatIsoUtc(epochSeconds: number): string {
   return new Date(epochSeconds * 1000).toISOString().replace(/\.000Z$/, 'Z');
 }
+
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** 解析 YYYY-MM-DD 为当日 UTC 零点的 epoch 秒;非真实日期返回 null,绝不顺延。 */
+export function parseUtcDate(input: string): number | null {
+  const m = DATE_RE.exec(input);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const dt = new Date(0);
+  dt.setUTCFullYear(year, month - 1, day);
+  dt.setUTCHours(0, 0, 0, 0);
+  if (
+    dt.getUTCFullYear() !== year ||
+    dt.getUTCMonth() !== month - 1 ||
+    dt.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return dt.getTime() / 1000;
+}
+
+/** 将 epoch 秒格式化为其所在的 UTC 日期(YYYY-MM-DD)。 */
+export function formatUtcDate(epochSeconds: number): string {
+  return formatIsoUtc(epochSeconds).slice(0, 10);
+}
