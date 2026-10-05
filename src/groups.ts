@@ -7,10 +7,14 @@
 //   异成员集合报冲突。
 // - 配置整次成功或不提交:未知设备、冲突、损坏或不可读存储及写入失败都明确
 //   报错并保留操作前状态。配置不改读数、规则和告警,导入也不改配置。
-// - 日报按 UTC 自然日切分(起点含、终点不含,首尾只统计重叠部分),按当时生效
-//   成员计算,不把最新成员套用到历史;首个版本生效前记为未知。各设备使用完整
-//   已存时序,区间两端读数即使在查询范围外也参与;成员切换不需要恰好有读数,
-//   首条读数之前、末条之后及孤立读数时段为未知,不外推。
+// - 日报按当地自然日切分(起点含、终点不含,首尾只统计重叠部分):默认按 UTC
+//   分日,--tz 指定 IANA 命名时区时按该时区的当地日期划分,日界线由实际时刻
+//   的当地日期归属确定,不按固定 86400 秒或固定偏移推算;时区只决定分日,不
+//   重新解释输入时刻或已存读数。同一当地日期的不连续时段合并统计、分别列出;
+//   没有实际时段的当地日期不生成日报。按当时生效成员计算,不把最新成员套用
+//   到历史;首个版本生效前记为未知。各设备使用完整已存时序,区间两端读数即使
+//   在查询范围外也参与;成员切换不需要恰好有读数,首条读数之前、末条之后及
+//   孤立读数时段为未知,不外推。
 // - 每个时段只有全部生效成员均处于非下降读数区间时才是有效覆盖,并计入成员
 //   消耗之和;任一成员下降则为异常覆盖,否则任一成员未知则为未知覆盖。异常与
 //   未知时段不计任何成员消耗,不以缺失设备为零补齐。覆盖秒数按分组实际时间
@@ -22,9 +26,9 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { dataFilePath, groupFilePath, loadStore, StoreError, type Reading } from './store.ts';
-import { DAY_SECONDS } from './report.ts';
 import { formatIsoUtc } from './time.ts';
 import { formatKwh } from './value.ts';
+import { localDaySegments, type LocalDaySegment } from './tz.ts';
 
 export interface GroupVersion {
   /** 生效时刻(含),epoch 秒。 */
@@ -377,10 +381,10 @@ export function cmdGroupHistory(opts: { id: string }): number {
 }
 
 /**
- * 分组能耗日报:按 UTC 自然日切分,按当时生效成员计算。只读,不写入数据。
- * 返回进程退出码。
+ * 分组能耗日报:按当地自然日切分(分日时区由 opts.tz 指定,默认 UTC),
+ * 按当时生效成员计算。只读,不写入数据。返回进程退出码。
  */
-export function cmdGroupDaily(opts: { id: string; from: number; to: number }): number {
+export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz: string }): number {
   let groups: Group[];
   try {
     groups = loadGroups(groupFilePath());
@@ -409,42 +413,62 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number }): n
   }
 
   console.log(`group: ${group.id}`);
+  console.log(`timezone: ${opts.tz}`);
+
+  // 查询范围按当地日界线切分;同一当地日期的不连续时段合并统计、分别列出。
+  interface GroupDayAggregate {
+    date: string;
+    segments: { seg: LocalDaySegment; periods: GroupPeriod[] }[];
+    valid: number;
+    anomaly: number;
+    unknown: number;
+    consumption: bigint;
+  }
+  const days: GroupDayAggregate[] = [];
+  const byDate = new Map<string, GroupDayAggregate>();
+  for (const seg of localDaySegments(opts.tz, opts.from, opts.to)) {
+    const stats = computeGroupSegment(group.versions, seriesByDevice, seg.start, seg.end);
+    let day = byDate.get(seg.date);
+    if (!day) {
+      day = { date: seg.date, segments: [], valid: 0, anomaly: 0, unknown: 0, consumption: 0n };
+      byDate.set(seg.date, day);
+      days.push(day);
+    }
+    day.segments.push({ seg, periods: stats.periods });
+    day.valid += stats.valid;
+    day.anomaly += stats.anomaly;
+    day.unknown += stats.unknown;
+    day.consumption += stats.consumption;
+  }
+
   let total = 0n;
   let computedDays = 0;
-  let days = 0;
   let incomplete = false;
-  for (
-    let dayStart = Math.floor(opts.from / DAY_SECONDS) * DAY_SECONDS;
-    dayStart < opts.to;
-    dayStart += DAY_SECONDS
-  ) {
-    const segStart = Math.max(dayStart, opts.from);
-    const segEnd = Math.min(dayStart + DAY_SECONDS, opts.to);
-    const stats = computeGroupSegment(group.versions, seriesByDevice, segStart, segEnd);
-    days++;
-
-    const date = formatIsoUtc(dayStart).slice(0, 10);
-    const dayIncomplete = stats.anomaly > 0 || stats.unknown > 0;
+  for (const day of days) {
+    const dayIncomplete = day.anomaly > 0 || day.unknown > 0;
     if (dayIncomplete) incomplete = true;
 
     let consumption: string;
-    if (stats.valid > 0) {
-      consumption = `consumption=${formatKwh(stats.consumption)} kWh (estimate)`;
-      total += stats.consumption;
+    if (day.valid > 0) {
+      consumption = `consumption=${formatKwh(day.consumption)} kWh (estimate)`;
+      total += day.consumption;
       computedDays++;
     } else {
       consumption = 'consumption=n/a (no valid coverage)';
     }
     let line =
-      `  ${date}  ${consumption}` +
-      `  valid=${stats.valid}s  anomaly=${stats.anomaly}s  unknown=${stats.unknown}s`;
+      `  ${day.date}  ${consumption}` +
+      `  valid=${day.valid}s  anomaly=${day.anomaly}s  unknown=${day.unknown}s`;
     if (dayIncomplete) line += '  INCOMPLETE';
     console.log(line);
-    for (const p of stats.periods) {
-      const members = p.members === null ? '(no version in effect)' : p.members.join(',');
-      console.log(
-        `    members=${members}  period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`,
-      );
+    for (const { seg, periods } of day.segments) {
+      console.log(`    utc=${formatIsoUtc(seg.start)}..${formatIsoUtc(seg.end)}`);
+      for (const p of periods) {
+        const members = p.members === null ? '(no version in effect)' : p.members.join(',');
+        console.log(
+          `      members=${members}  period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`,
+        );
+      }
     }
   }
 
@@ -456,7 +480,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number }): n
     ? 'status=INCOMPLETE (unknown or anomaly coverage present)'
     : 'status=complete';
   console.log(
-    `  summary: group=${group.id}  computed=${computedDays}/${days} day(s)  ${totalText}  ${status}`,
+    `  summary: group=${group.id}  computed=${computedDays}/${days.length} day(s)  ${totalText}  ${status}`,
   );
   return 0;
 }
