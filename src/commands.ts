@@ -93,10 +93,10 @@ export function cmdImport(file: string): number {
 
   // 去重与冲突检测:先文件内部,再与已存数据比对。身份 = (设备, 实际时刻)。
   const key = (device: string, ts: number): string => `${device} ${ts}`;
-  const inStore = new Map<string, number>();
+  const inStore = new Map<string, bigint>();
   for (const r of existing) inStore.set(key(r.device, r.ts), r.milli);
 
-  const inFile = new Map<string, number>();
+  const inFile = new Map<string, bigint>();
   const toAdd: Reading[] = [];
   const conflicts: string[] = [];
   let duplicates = 0;
@@ -196,7 +196,7 @@ export function cmdReadings(filter: ReadingsFilter): number {
     printed = true;
 
     console.log(`device: ${device}`);
-    let total = 0;
+    let total = 0n;
     for (const { r, prev } of selected) {
       let line = `  ${formatIsoUtc(r.ts)}  reading=${formatKwh(r.milli)} kWh`;
       if (prev === null) {
@@ -205,7 +205,7 @@ export function cmdReadings(filter: ReadingsFilter): number {
         const duration = r.ts - prev.ts;
         const diff = r.milli - prev.milli;
         line += `  interval=${formatIsoUtc(prev.ts)}..${formatIsoUtc(r.ts)} (${duration}s)`;
-        if (diff < 0) {
+        if (diff < 0n) {
           line += `  consumption=ANOMALY: decrease of ${formatKwh(-diff)} kWh (excluded from summary)`;
         } else {
           line += `  consumption=${formatKwh(diff)} kWh`;

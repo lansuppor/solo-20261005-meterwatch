@@ -22,15 +22,15 @@ import { dirname } from 'node:path';
 import { alertFilePath, dataFilePath, loadStore, StoreError, type Reading } from './store.ts';
 import { computeDay, DAY_SECONDS } from './report.ts';
 import { formatIsoUtc, parseIso8601 } from './time.ts';
-import { formatKwh, formatKwhBig } from './value.ts';
+import { formatKwh, milliToJson, parseStoredMilli } from './value.ts';
 
 export interface AlertRule {
   /** 规则标识(非空、唯一,已去首尾空白)。 */
   id: string;
   /** 绑定设备(已去首尾空白,区分大小写),创建后固定。 */
   device: string;
-  /** 阈值,毫千瓦时整数,创建后固定。 */
-  thresholdMilli: number;
+  /** 阈值,毫千瓦时 BigInt 整数(可超出 Number 安全范围),创建后固定。 */
+  thresholdMilli: bigint;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -99,7 +99,12 @@ function loadAlertState(path: string): AlertState {
   if (!Array.isArray(o.alerts)) throw bad('missing alerts array');
 
   const ruleIds = new Set<string>();
+  const rules: AlertRule[] = [];
   for (const r of o.rules as Array<Record<string, unknown>>) {
+    // thresholdMilli 兼容旧的数值型安全整数与新的十进制字符串;数值型超出
+    // 安全整数范围时原值已不可知,按损坏数据拒绝,不猜测原值。
+    const thresholdMilli =
+      r !== null && typeof r === 'object' ? parseStoredMilli(r.thresholdMilli) : null;
     const ok =
       r !== null &&
       typeof r === 'object' &&
@@ -107,11 +112,11 @@ function loadAlertState(path: string): AlertState {
       r.id.length > 0 &&
       typeof r.device === 'string' &&
       r.device.length > 0 &&
-      Number.isSafeInteger(r.thresholdMilli) &&
-      (r.thresholdMilli as number) >= 0;
+      thresholdMilli !== null;
     if (!ok) throw bad('invalid rule entry');
     if (ruleIds.has(r.id as string)) throw bad(`duplicate rule id '${r.id}'`);
     ruleIds.add(r.id as string);
+    rules.push({ id: r.id as string, device: r.device as string, thresholdMilli });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -143,14 +148,32 @@ function loadAlertState(path: string): AlertState {
       if (!eok) throw bad('invalid alert event');
     }
   }
-  return data as unknown as AlertState;
+  return {
+    nextAlertNum: o.nextAlertNum as number,
+    nextEventSeq: o.nextEventSeq as number,
+    rules,
+    alerts: o.alerts as AlertRecord[],
+  };
 }
 
 /** 原子写入告警存储;失败抛错,原有数据保持不变。 */
 function saveAlertState(path: string, state: AlertState): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  const body = JSON.stringify({ version: 1, ...state }, null, 2) + '\n';
+  const body =
+    JSON.stringify(
+      {
+        version: 1,
+        ...state,
+        rules: state.rules.map((r) => ({
+          id: r.id,
+          device: r.device,
+          thresholdMilli: milliToJson(r.thresholdMilli),
+        })),
+      },
+      null,
+      2,
+    ) + '\n';
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);
@@ -188,7 +211,7 @@ function undecidableReason(stats: { unknown: number; anomaly: number }): string 
 export function cmdRuleCreate(opts: {
   id: string;
   device: string;
-  thresholdMilli: number;
+  thresholdMilli: bigint;
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -302,7 +325,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
     throw e;
   }
 
-  const threshold = BigInt(rule.thresholdMilli);
+  const threshold = rule.thresholdMilli;
   const lines: string[] = [];
   for (let dayStart = opts.from; dayStart < opts.to; dayStart += DAY_SECONDS) {
     const date = formatIsoUtc(dayStart).slice(0, 10);
@@ -314,7 +337,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: number; to: number }):
     }
     const exceeded = stats.consumption > threshold;
     const cmp =
-      `consumption=${formatKwhBig(stats.consumption)} kWh ` +
+      `consumption=${formatKwh(stats.consumption)} kWh ` +
       `${exceeded ? '>' : '<='} threshold=${formatKwh(rule.thresholdMilli)} kWh`;
     const open = state.alerts.find(
       (a) => a.ruleId === rule.id && a.date === date && a.status === 'triggered',
@@ -414,7 +437,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
     return 0;
   }
 
-  const threshold = BigInt(rule.thresholdMilli);
+  const threshold = rule.thresholdMilli;
   for (const dayStart of dayStarts) {
     const date = formatIsoUtc(dayStart).slice(0, 10);
     const stats = computeDay(series, dayStart, dayStart + DAY_SECONDS);
@@ -423,7 +446,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
     } else {
       const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
       console.log(
-        `  ${date}  consumption=${formatKwhBig(stats.consumption)} kWh ` +
+        `  ${date}  consumption=${formatKwh(stats.consumption)} kWh ` +
           `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)`,
       );
     }
@@ -443,7 +466,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: number; to?: number }):
         .map((e) => {
           const consumption =
             e.consumptionMilli !== undefined
-              ? ` (consumption=${formatKwhBig(BigInt(e.consumptionMilli))} kWh)`
+              ? ` (consumption=${formatKwh(BigInt(e.consumptionMilli))} kWh)`
               : '';
           return `#${e.seq} ${e.type}${consumption}`;
         })

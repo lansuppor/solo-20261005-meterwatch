@@ -74,6 +74,13 @@ CSV 格式:
   $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json)
   $METERWATCH_DATA_DIR/alerts.json(告警规则与历史,与读数文件相互独立)
 
+数值精度与兼容:
+  读数与阈值为非负、最多三位小数的 kWh,量级不限(不因超过 Number 安全
+  整数范围而拒绝);解析、求差、分摊、汇总、比较、保存与显示全程精确,
+  输出固定三位小数。旧版文件中以数值型安全整数保存的读数、阈值与历史
+  无需转换即可继续使用,并能与新导入的大数值共同计算;大数值在文件中
+  以十进制字符串保存,数值型超出安全整数范围的数据按损坏拒绝。
+
 退出码: 0 成功;1 数据或读写错误;2 参数错误`;
 
 function usageError(message: string): number {

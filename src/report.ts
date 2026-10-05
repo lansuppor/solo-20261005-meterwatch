@@ -13,7 +13,7 @@
 
 import { loadStore, StoreError, dataFilePath, type Reading } from './store.ts';
 import { formatIsoUtc } from './time.ts';
-import { formatKwhBig } from './value.ts';
+import { formatKwh } from './value.ts';
 
 export interface DailyFilter {
   devices: string[];
@@ -52,12 +52,12 @@ export function computeDay(series: Reading[], segStart: number, segEnd: number):
     const hi = Math.min(b.ts, segEnd);
     if (lo >= hi) continue;
     const diff = b.milli - a.milli;
-    if (diff < 0) {
+    if (diff < 0n) {
       anomaly += hi - lo;
     } else {
       valid += hi - lo;
       const duration = BigInt(b.ts - a.ts);
-      const total = BigInt(diff);
+      const total = diff;
       // 从区间起点累计到 t 的比例量(向下取整);BigInt 除法向零截断,
       // 被除数非负,等价于向下取整。
       const cumulative = (t: number): bigint => (total * BigInt(t - a.ts)) / duration;
@@ -133,7 +133,7 @@ export function cmdDaily(filter: DailyFilter): number {
 
       let consumption: string;
       if (stats.valid > 0) {
-        consumption = `consumption=${formatKwhBig(stats.consumption)} kWh (estimate)`;
+        consumption = `consumption=${formatKwh(stats.consumption)} kWh (estimate)`;
         total += stats.consumption;
         computedDays++;
       } else {
@@ -148,7 +148,7 @@ export function cmdDaily(filter: DailyFilter): number {
 
     const totalText =
       computedDays > 0
-        ? `total consumption=${formatKwhBig(total)} kWh (estimate)`
+        ? `total consumption=${formatKwh(total)} kWh (estimate)`
         : 'total consumption=n/a (no valid coverage)';
     const status = incomplete
       ? 'status=INCOMPLETE (unknown or anomaly coverage present)'
