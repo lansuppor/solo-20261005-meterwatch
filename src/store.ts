@@ -19,6 +19,30 @@ export interface Reading {
   milli: bigint;
 }
 
+export interface CorrectionItem {
+  /** 设备标识(已去除首尾空白,区分大小写)。 */
+  device: string;
+  /** 实际时刻,epoch 秒。 */
+  ts: number;
+  /** 提交时核验的预期原值,毫千瓦时 BigInt。 */
+  expectedMilli: bigint;
+  /** 替换值,毫千瓦时 BigInt。 */
+  replacementMilli: bigint;
+}
+
+export interface Correction {
+  /** 请求标识(已去除首尾空白,区分大小写),在数据目录内唯一。 */
+  requestId: string;
+  /** 本次提交的修正项,按提交顺序保存。 */
+  items: CorrectionItem[];
+}
+
+export interface StoreData {
+  readings: Reading[];
+  /** 已成功提交的修正历史,按提交顺序;与读数同文件原子持久化。 */
+  corrections: Correction[];
+}
+
 export class StoreError extends Error {}
 
 export function dataFilePath(): string {
@@ -50,13 +74,59 @@ export function parseStoredMilli(value: unknown): bigint | null {
   return null;
 }
 
-/** 读取存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
-export function loadStore(path: string): Reading[] {
+/**
+ * 解析存储中的修正历史;字段缺失按空历史(旧版文件),存在但结构非法返回 null。
+ */
+function parseStoredCorrections(value: unknown): Correction[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const out: Correction[] = [];
+  const ids = new Set<string>();
+  for (const c of value as Array<Record<string, unknown>>) {
+    if (
+      c === null ||
+      typeof c !== 'object' ||
+      typeof c.requestId !== 'string' ||
+      c.requestId.length === 0 ||
+      !Array.isArray(c.items) ||
+      c.items.length === 0 ||
+      ids.has(c.requestId)
+    ) {
+      return null;
+    }
+    const items: CorrectionItem[] = [];
+    for (const it of c.items as Array<Record<string, unknown>>) {
+      const expectedMilli = it !== null && typeof it === 'object' ? parseStoredMilli(it.expectedMilli) : null;
+      const replacementMilli = it !== null && typeof it === 'object' ? parseStoredMilli(it.replacementMilli) : null;
+      const ok =
+        it !== null &&
+        typeof it === 'object' &&
+        typeof it.device === 'string' &&
+        it.device.length > 0 &&
+        Number.isSafeInteger(it.ts) &&
+        expectedMilli !== null &&
+        replacementMilli !== null;
+      if (!ok) return null;
+      items.push({
+        device: it.device as string,
+        ts: it.ts as number,
+        expectedMilli: expectedMilli as bigint,
+        replacementMilli: replacementMilli as bigint,
+      });
+    }
+    ids.add(c.requestId);
+    out.push({ requestId: c.requestId, items });
+  }
+  return out;
+}
+
+/** 读取存储(读数与修正历史);文件不存在返回空数据,存在但无法读取或内容损坏抛出 StoreError。 */
+export function loadData(path: string): StoreData {
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { readings: [], corrections: [] };
     throw new StoreError(`cannot read storage file ${path}: ${(err as Error).message}`);
   }
   let data: unknown;
@@ -84,18 +154,36 @@ export function loadStore(path: string): Reading[] {
     }
     out.push({ device: r.device as string, ts: r.ts as number, milli: milli as bigint });
   }
-  return out;
+  const corrections = parseStoredCorrections((data as { corrections?: unknown })?.corrections);
+  if (corrections === null) {
+    throw new StoreError(`storage file ${path} is corrupted (invalid corrections)`);
+  }
+  return { readings: out, corrections };
 }
 
-/** 原子写入存储;失败抛错,原有数据保持不变。 */
-export function saveStore(path: string, readings: Reading[]): void {
+/** 只取读数的便捷封装;语义与 loadData 相同。 */
+export function loadStore(path: string): Reading[] {
+  return loadData(path).readings;
+}
+
+/** 原子写入存储(读数与修正历史同文件同时持久化);失败抛错,原有数据保持不变。 */
+export function saveData(path: string, data: StoreData): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   const body =
     JSON.stringify(
       {
         version: 1,
-        readings: readings.map((r) => ({ device: r.device, ts: r.ts, milli: r.milli.toString() })),
+        readings: data.readings.map((r) => ({ device: r.device, ts: r.ts, milli: r.milli.toString() })),
+        corrections: data.corrections.map((c) => ({
+          requestId: c.requestId,
+          items: c.items.map((it) => ({
+            device: it.device,
+            ts: it.ts,
+            expectedMilli: it.expectedMilli.toString(),
+            replacementMilli: it.replacementMilli.toString(),
+          })),
+        })),
       },
       null,
       2,

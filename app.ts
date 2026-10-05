@@ -2,8 +2,10 @@ import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
 import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
+import { cmdCorrect, cmdCorrections } from './src/correct.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { parseKwh } from './src/value.ts';
+import type { CorrectionItem } from './src/store.ts';
 
 const name = 'meterwatch';
 
@@ -32,6 +34,10 @@ Usage:
                                     查看分组成员版本历史(只读)
   node app.ts group daily --id <id> --from <iso> --to <iso>
                                     按当时生效成员的分组能耗日报(只读)
+  node app.ts correct --request <id> --item --device <设备> --at <iso> --expect <kWh> --set <kWh>
+                                    [--item --device ... --at ... --expect ... --set ...]...
+                                    批量修正已存读数的累计值(整批成功或整批拒绝)
+  node app.ts corrections             查看修正历史(只读)
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -70,6 +76,25 @@ Usage:
   切换均不重置分摊起点,拆开查询相加一致。每天显示生效成员及其时段、估算
   消耗与有效/异常/未知秒数(三者之和等于当天查询时长);有异常或未知标为
   不完整,无有效覆盖显示无法计算。配置不改读数、规则和告警,导入不改配置。
+
+修正(correct / corrections):
+  correct 一次提交指定非空请求标识(--request,去首尾空白、区分大小写,在
+  数据目录内唯一)及至少一个 --item 修正项;每项 --device、--at、--expect、
+  --set 各恰好一个,给出设备、实际时刻(秒精度 ISO8601 带 Z 或数字时区
+  偏移)、预期原读数和替换读数(均为非负、最多三位小数 kWh,任意大数精确)。
+  只修改已有读数的累计值,不新增或删除读数;同批同一读数身份(设备+实际
+  时刻)只允许一项;替换值可等于原值,但仍须核验预期原值。首次提交逐项把
+  预期原值与操作前已存值精确比较,全部匹配才整体替换,成功报告请求标识与
+  实际改变数;任一项身份不存在或原值不符均指出原因、整批拒绝,不改变其他
+  项,也不占用请求标识(失败后可修改内容用同一标识重新提交)。读数替换与
+  请求成功记录同时持久化,写入失败保留操作前全部状态。同标识、同修正内容
+  重放直接返回原成功结果,不重新校验当前读数、不再次替换(即使这些读数
+  后来又被其他请求修正);修正项顺序、等价时区及等价十进制写法不影响内容
+  等价性;同标识异内容报冲突且保持状态。corrections 按成功提交顺序显示
+  各请求及各项设备、时刻、原值和替换值,只读。修正后 readings、daily、
+  group daily 与 alerts 的当前消耗按新相邻区间重算;分组成员、规则与告警
+  记录不变,检测状态仍需显式 evaluate 更新;后续 import 按当前读数判重与
+  冲突,并保留修正历史。
 
 告警规则(rule / evaluate / alerts / ack):
   规则标识非空且在设备与分组两类规则间唯一(去首尾空白、区分大小写);用
@@ -112,7 +137,8 @@ CSV 格式:
   已超出安全整数范围(精度已丢失)按损坏数据拒绝,不猜测原值。
 
 数据位置:
-  $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json)
+  $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json;
+           读数与修正历史同文件保存,旧版无修正历史的文件可直接使用)
   $METERWATCH_DATA_DIR/alerts.json(告警规则与历史,与读数文件相互独立)
   $METERWATCH_DATA_DIR/groups.json(分组配置,与读数、告警文件相互独立)
 
@@ -364,6 +390,62 @@ function cmdGroup(rest: string[]): number {
   return usageError(`无法识别的 group 子命令 '${sub}'`);
 }
 
+/**
+ * 解析 correct 的修正项:以裸 '--item' 分段,每段需 --device/--at/--expect/--set
+ * 各恰好一个。出错返回错误消息字符串。
+ */
+function parseCorrectItems(rest: string[]): { requestId: string; items: CorrectionItem[] } | string {
+  const segments: string[][] = [[]];
+  for (const tok of rest) {
+    if (tok === '--item') segments.push([]);
+    else segments[segments.length - 1].push(tok);
+  }
+  const headFlags = parseFlags(segments[0], ['--request']);
+  if (typeof headFlags === 'string') return headFlags;
+  const requestRaw = oneFlag(headFlags, '--request');
+  if (requestRaw === null) return "'correct' 需要 --request 恰好一个";
+  const requestId = requestRaw.trim();
+  if (requestId === '') return '请求标识不能为空';
+  const itemSegs = segments.slice(1);
+  if (itemSegs.length === 0) {
+    return "'correct' 需要至少一个 --item(--item --device <设备> --at <iso> --expect <kWh> --set <kWh>)";
+  }
+  const items: CorrectionItem[] = [];
+  for (const seg of itemSegs) {
+    const flags = parseFlags(seg, ['--device', '--at', '--expect', '--set']);
+    if (typeof flags === 'string') return flags;
+    const deviceRaw = oneFlag(flags, '--device');
+    const atRaw = oneFlag(flags, '--at');
+    const expectRaw = oneFlag(flags, '--expect');
+    const setRaw = oneFlag(flags, '--set');
+    if (deviceRaw === null || atRaw === null || expectRaw === null || setRaw === null) {
+      return '每个 --item 需要 --device、--at、--expect、--set 各恰好一个';
+    }
+    const device = deviceRaw.trim();
+    if (device === '') return "'--device' 的值不能为空";
+    const ts = parseIso8601(atRaw.trim());
+    if (ts === null) {
+      return `选项 '--at' 的时间无效: '${atRaw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`;
+    }
+    const expectedMilli = parseKwh(expectRaw.trim());
+    if (expectedMilli === null) {
+      return `预期原读数无效: '${expectRaw.trim()}'(需非负、最多三位小数的 kWh)`;
+    }
+    const replacementMilli = parseKwh(setRaw.trim());
+    if (replacementMilli === null) {
+      return `替换读数无效: '${setRaw.trim()}'(需非负、最多三位小数的 kWh)`;
+    }
+    items.push({ device, ts, expectedMilli, replacementMilli });
+  }
+  return { requestId, items };
+}
+
+function cmdCorrectEntry(rest: string[]): number {
+  const parsed = parseCorrectItems(rest);
+  if (typeof parsed === 'string') return usageError(parsed);
+  return cmdCorrect(parsed.requestId, parsed.items);
+}
+
 function main(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
@@ -405,6 +487,12 @@ function main(args: string[]): number {
   if (cmd === 'evaluate') return cmdEvaluateEntry(rest);
   if (cmd === 'alerts') return cmdAlertsEntry(rest);
   if (cmd === 'group') return cmdGroup(rest);
+  if (cmd === 'correct') return cmdCorrectEntry(rest);
+
+  if (cmd === 'corrections') {
+    if (rest.length !== 0) return usageError("'corrections' 不接受参数");
+    return cmdCorrections();
+  }
 
   if (cmd === 'ack') {
     if (rest.length !== 1) return usageError("'ack' 需要且仅需要一个告警标识");
