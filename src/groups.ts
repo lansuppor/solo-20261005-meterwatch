@@ -36,6 +36,11 @@ import {
   mergeGaps,
   type GapDetail,
 } from './report.ts';
+import {
+  classifySchedule,
+  parseSchedule,
+  type ClassPeriod,
+} from './schedule.ts';
 
 export interface GroupVersion {
   /** 生效时刻(含),epoch 秒。 */
@@ -545,5 +550,164 @@ export function cmdGroupDaily(opts: {
   console.log(
     `  summary: group=${group.id}  computed=${computedDays}/${days.length} day(s)  ${totalText}  ${status}`,
   );
+  return 0;
+}
+
+interface ClassStats {
+  /** 有效(全部成员非下降且未超采样间隔限制)覆盖秒数,按分组实际时间计。 */
+  valid: number;
+  /** 异常(任一成员下降)覆盖秒数。 */
+  anomaly: number;
+  /** 未知(无生效版本或任一成员未知)覆盖秒数。 */
+  unknown: number;
+  /** unknown 中由成员过长区间造成的秒数(并集,不叠加成员秒数)。 */
+  gapUnknown: number;
+  /** 与统计范围相交的成员过长区间明细(设备与原始相邻读数时刻),已去重。 */
+  gaps: GapDetail[];
+  /** 有效时段内全部生效成员的分摊消耗之和,毫千瓦时 BigInt。 */
+  consumption: bigint;
+}
+
+/** 汇总一组同类时段(运行或非运行)的覆盖与消耗;各时段互不重叠。 */
+function computeClassStats(
+  group: Group,
+  seriesByDevice: Map<string, Reading[]>,
+  periods: ClassPeriod[],
+  maxInterval?: number,
+): ClassStats {
+  const out: ClassStats = {
+    valid: 0,
+    anomaly: 0,
+    unknown: 0,
+    gapUnknown: 0,
+    gaps: [],
+    consumption: 0n,
+  };
+  for (const p of periods) {
+    const s = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end, maxInterval);
+    out.valid += s.valid;
+    out.anomaly += s.anomaly;
+    out.unknown += s.unknown;
+    out.gapUnknown += s.gapUnknown;
+    mergeGaps(out.gaps, s.gaps);
+    out.consumption += s.consumption;
+  }
+  return out;
+}
+
+/** 输出一类时段(运行或非运行)的统计行、实际 UTC 时段与过长区间明细。 */
+function printClass(
+  label: string,
+  stats: ClassStats,
+  periods: ClassPeriod[],
+  maxInterval?: number,
+): void {
+  console.log(`${label}:`);
+  const consumptionText =
+    stats.valid > 0
+      ? `consumption=${formatKwh(stats.consumption)} kWh (estimate)`
+      : 'consumption=n/a (no valid coverage)';
+  let line =
+    `  ${consumptionText}` +
+    `  valid=${stats.valid}s  anomaly=${stats.anomaly}s  unknown=${stats.unknown}s`;
+  if (maxInterval !== undefined) line += `  gap=${stats.gapUnknown}s`;
+  if (stats.anomaly > 0 || stats.unknown > 0) line += '  INCOMPLETE';
+  console.log(line);
+  for (const p of periods) {
+    console.log(`  period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+  }
+  for (const g of stats.gaps) {
+    console.log(formatGapLine(g));
+  }
+}
+
+/**
+ * 分组运行/非运行时段报表:按本地每周运行时间表文件把查询范围分为运行与
+ * 非运行两类时段(--tz 只解释时间表,省略为 UTC),分别统计覆盖与消耗,
+ * 用于核查停运消耗。成员与消耗口径同 group daily;两类覆盖合计等于查询
+ * 时长,消耗合计等于同范围、同限制的分组日报。只读,不改写时间表或业务
+ * 存储,不自动评估。返回进程退出码。
+ */
+export function cmdGroupSchedule(opts: {
+  id: string;
+  /** 每周运行时间表文件路径(本地文本文件)。 */
+  schedulePath: string;
+  from: number;
+  to: number;
+  tz?: string;
+  /** 最大采样间隔限制(正整数秒);省略表示无上限。只影响本次查询结果。 */
+  maxInterval?: number;
+}): number {
+  const tzName = opts.tz ?? 'UTC';
+  const tz = loadTimezone(tzName);
+  if (!tz) {
+    err(`unknown timezone '${tzName}' (expect an IANA timezone name supported by this runtime)`);
+    return 2;
+  }
+
+  let scheduleText: string;
+  try {
+    scheduleText = readFileSync(opts.schedulePath, 'utf8');
+  } catch (e) {
+    err(`cannot read schedule file ${opts.schedulePath}: ${(e as Error).message}`);
+    return 1;
+  }
+  const parsed = parseSchedule(scheduleText);
+  if (typeof parsed === 'string') {
+    err(`invalid schedule file ${opts.schedulePath}: ${parsed}`);
+    return 2;
+  }
+  const windows = parsed;
+
+  let groups: Group[];
+  try {
+    groups = loadGroups(groupFilePath());
+  } catch (e) {
+    if (e instanceof StoreError) {
+      err(e.message);
+      return 1;
+    }
+    throw e;
+  }
+  const group = groups.find((g) => g.id === opts.id);
+  if (!group) {
+    err(`unknown group '${opts.id}'`);
+    return 1;
+  }
+
+  let seriesByDevice: Map<string, Reading[]>;
+  try {
+    seriesByDevice = loadCheckedSeriesByDevice(loadStore(dataFilePath()));
+  } catch (e) {
+    if (e instanceof StoreError) {
+      err(e.message);
+      return 1;
+    }
+    throw e;
+  }
+
+  // 全部校验通过后才输出报表,失败时不留下部分报表。
+  const classified = classifySchedule(tz, windows, opts.from, opts.to);
+  const runStats = computeClassStats(group, seriesByDevice, classified.running, opts.maxInterval);
+  const nonStats = computeClassStats(group, seriesByDevice, classified.nonRunning, opts.maxInterval);
+
+  console.log(`group: ${group.id}`);
+  console.log(`timezone: ${tzName}`);
+  console.log(`max-interval: ${maxIntervalText(opts.maxInterval)}`);
+  console.log(`schedule: ${opts.schedulePath}  windows=${windows.length}`);
+  printClass('running', runStats, classified.running, opts.maxInterval);
+  printClass('non-running', nonStats, classified.nonRunning, opts.maxInterval);
+
+  const totalValid = runStats.valid + nonStats.valid;
+  const totalText =
+    totalValid > 0
+      ? `total consumption=${formatKwh(runStats.consumption + nonStats.consumption)} kWh (estimate)`
+      : 'total consumption=n/a (no valid coverage)';
+  const incomplete =
+    runStats.anomaly + runStats.unknown + nonStats.anomaly + nonStats.unknown > 0;
+  const status = incomplete
+    ? 'status=INCOMPLETE (unknown or anomaly coverage present)'
+    : 'status=complete';
+  console.log(`summary: group=${group.id}  ${totalText}  ${status}`);
   return 0;
 }

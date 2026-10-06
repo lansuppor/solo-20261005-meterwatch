@@ -141,6 +141,32 @@ function nextTransition(fmt: Intl.DateTimeFormat, t: number, o0: number, limit: 
   return Infinity;
 }
 
+export interface OffsetSpan {
+  /** 时段起点(含),epoch 秒。 */
+  start: number;
+  /** 时段终点(不含),epoch 秒。 */
+  end: number;
+  /** 该时段内恒定的时区偏移(墙钟 - UTC),秒。 */
+  offset: number;
+}
+
+/**
+ * 把 [from, to) 切成偏移恒定的最大时段(在偏移切换处分割)。
+ * 夏令时前拨跳过的墙钟不出现在任何时段的墙钟范围内;回拨重复的墙钟
+ * 出现在两个相邻时段中(各自偏移不同),各自独立分类。
+ */
+export function offsetSpans(fmt: Intl.DateTimeFormat, from: number, to: number): OffsetSpan[] {
+  const spans: OffsetSpan[] = [];
+  let cursor = from;
+  while (cursor < to) {
+    const o = offsetAt(fmt, cursor);
+    const end = Math.min(nextTransition(fmt, cursor, o, to), to);
+    spans.push({ start: cursor, end, offset: o });
+    cursor = end;
+  }
+  return spans;
+}
+
 /**
  * 把 [from, to) 按当地自然日切分。返回按首次出现排序(即日期升序)的
  * 当地日期,每个日期带实际统计的 UTC 时段;同一日期的不连续时段合并到
