@@ -56,21 +56,23 @@ export interface StoreData {
 
 export class StoreError extends Error {}
 
+/** 数据目录:默认 ~/.meterwatch,可用环境变量 METERWATCH_DATA_DIR 指定。 */
+export function dataDirPath(): string {
+  return process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
+}
+
 export function dataFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'readings.json');
+  return join(dataDirPath(), 'readings.json');
 }
 
 /** 告警规则与历史的存储文件,与读数文件同目录、相互独立。 */
 export function alertFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'alerts.json');
+  return join(dataDirPath(), 'alerts.json');
 }
 
 /** 分组配置的存储文件,与读数、告警文件同目录、相互独立。 */
 export function groupFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'groups.json');
+  return join(dataDirPath(), 'groups.json');
 }
 
 /**
@@ -133,11 +135,13 @@ function parseStoredCorrections(value: unknown): Correction[] | null {
 
 /**
  * 解析存储中的撤销历史;字段缺失按空历史(旧版文件,原修正视为未撤销),
- * 存在但结构非法或与修正历史不一致返回 null。
+ * 存在但结构非法或与修正历史不一致抛出 StoreError 并指出原因。
  */
-function parseStoredUndos(value: unknown, corrections: Correction[]): UndoRecord[] | null {
+function parseStoredUndos(value: unknown, corrections: Correction[], path: string): UndoRecord[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value)) return null;
+  const bad = (what: string): StoreError =>
+    new StoreError(`storage file ${path} is corrupted (${what})`);
+  if (!Array.isArray(value)) throw bad('invalid undos');
   const correctionIds = new Set(corrections.map((c) => c.requestId));
   const ids = new Set<string>();
   const targets = new Set<string>();
@@ -152,10 +156,17 @@ function parseStoredUndos(value: unknown, corrections: Correction[]): UndoRecord
       u.targetId.length > 0 &&
       Number.isSafeInteger(u.restored) &&
       (u.restored as number) >= 0;
-    if (!ok) return null;
+    if (!ok) throw bad('invalid undos');
     // 撤销与修正共用唯一标识空间;目标必须是已存修正且每个目标最多被撤销一次。
-    if (ids.has(u.requestId as string) || correctionIds.has(u.requestId as string)) return null;
-    if (!correctionIds.has(u.targetId as string) || targets.has(u.targetId as string)) return null;
+    if (ids.has(u.requestId as string) || correctionIds.has(u.requestId as string)) {
+      throw bad(`duplicate undo request id '${u.requestId}'`);
+    }
+    if (!correctionIds.has(u.targetId as string)) {
+      throw bad(`undo '${u.requestId}' references missing correction '${u.targetId}'`);
+    }
+    if (targets.has(u.targetId as string)) {
+      throw bad(`correction '${u.targetId}' is undone more than once`);
+    }
     ids.add(u.requestId as string);
     targets.add(u.targetId as string);
     out.push({
@@ -167,15 +178,8 @@ function parseStoredUndos(value: unknown, corrections: Correction[]): UndoRecord
   return out;
 }
 
-/** 读取存储(读数与修正历史);文件不存在返回空数据,存在但无法读取或内容损坏抛出 StoreError。 */
-export function loadData(path: string): StoreData {
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { readings: [], corrections: [], undos: [] };
-    throw new StoreError(`cannot read storage file ${path}: ${(err as Error).message}`);
-  }
+/** 解析存储文本(读数与修正、撤销历史);内容损坏抛出 StoreError,消息中含 path 便于定位。 */
+export function parseStoreDataJson(text: string, path: string): StoreData {
   let data: unknown;
   try {
     data = JSON.parse(text);
@@ -205,11 +209,20 @@ export function loadData(path: string): StoreData {
   if (corrections === null) {
     throw new StoreError(`storage file ${path} is corrupted (invalid corrections)`);
   }
-  const undos = parseStoredUndos((data as { undos?: unknown })?.undos, corrections);
-  if (undos === null) {
-    throw new StoreError(`storage file ${path} is corrupted (invalid undos)`);
-  }
+  const undos = parseStoredUndos((data as { undos?: unknown })?.undos, corrections, path);
   return { readings: out, corrections, undos };
+}
+
+/** 读取存储(读数与修正历史);文件不存在返回空数据,存在但无法读取或内容损坏抛出 StoreError。 */
+export function loadData(path: string): StoreData {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { readings: [], corrections: [], undos: [] };
+    throw new StoreError(`cannot read storage file ${path}: ${(err as Error).message}`);
+  }
+  return parseStoreDataJson(text, path);
 }
 
 /** 只取读数的便捷封装;语义与 loadData 相同。 */
@@ -217,11 +230,9 @@ export function loadStore(path: string): Reading[] {
   return loadData(path).readings;
 }
 
-/** 原子写入存储(读数、修正历史与撤销记录同文件同时持久化);失败抛错,原有数据保持不变。 */
-export function saveData(path: string, data: StoreData): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}`;
-  const body =
+/** 序列化存储(读数、修正历史与撤销记录同文件);毫千瓦时以十进制字符串保存。 */
+export function serializeStoreData(data: StoreData): string {
+  return (
     JSON.stringify(
       {
         version: 1,
@@ -243,7 +254,15 @@ export function saveData(path: string, data: StoreData): void {
       },
       null,
       2,
-    ) + '\n';
+    ) + '\n'
+  );
+}
+
+/** 原子写入存储(读数、修正历史与撤销记录同文件同时持久化);失败抛错,原有数据保持不变。 */
+export function saveData(path: string, data: StoreData): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}`;
+  const body = serializeStoreData(data);
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);

@@ -45,15 +45,8 @@ function err(message: string): void {
   console.error(`meterwatch: ${message}`);
 }
 
-/** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
-export function loadGroups(path: string): Group[] {
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
-  }
+/** 解析分组存储文本;内容损坏抛出 StoreError,消息中含 path 便于定位。 */
+export function parseGroupsJson(text: string, path: string): Group[] {
   let data: unknown;
   try {
     data = JSON.parse(text);
@@ -108,11 +101,28 @@ export function loadGroups(path: string): Group[] {
   return groups;
 }
 
+/** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
+export function loadGroups(path: string): Group[] {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
+  }
+  return parseGroupsJson(text, path);
+}
+
+/** 序列化分组存储。 */
+export function serializeGroups(groups: Group[]): string {
+  return JSON.stringify({ version: 1, groups }, null, 2) + '\n';
+}
+
 /** 原子写入分组存储;失败抛错,原有数据保持不变。 */
 function saveGroups(path: string, groups: Group[]): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  const body = JSON.stringify({ version: 1, groups }, null, 2) + '\n';
+  const body = serializeGroups(groups);
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);

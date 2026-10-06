@@ -3,6 +3,8 @@ import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
+import { cmdBackup, cmdRestore, recoverInterruptedRestore } from './src/backup.ts';
+import { acquireLock } from './src/lock.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -41,6 +43,8 @@ Usage:
   node app.ts undo --request <id> --target <修正请求标识>
                                     整批撤销一次已成功修正(恢复实际改变过的读数)
   node app.ts corrections             查看修正与撤销历史(只读)
+  node app.ts backup <快照文件>       整库备份:导出带完整性校验的快照(只读业务数据)
+  node app.ts restore <快照文件>      整库恢复:三个业务存储作为一次提交整体替换为快照内容
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -170,6 +174,27 @@ CSV 格式:
   兼容旧版 readings.json / alerts.json 中以 JSON 数值保存的安全整数
   读数与阈值,无需手工转换;新版以十进制字符串保存。数值型毫千瓦时若
   已超出安全整数范围(精度已丢失)按损坏数据拒绝,不猜测原值。
+
+备份与恢复(backup / restore):
+  backup 把当前数据目录的三个业务存储(readings.json、alerts.json、
+  groups.json)导出为单个快照文件:完整保留累计读数、修正与撤销请求及
+  顺序、分组成员版本、设备与分组规则及时区、告警标识、检测与确认状态、
+  事件顺序和当时消耗,以及后续编号所需状态;任意大数以十进制字符串精确
+  保存。快照带格式版本与 SHA-256 完整性校验;快照文件必须位于数据目录
+  之外,且输出文件必须事先不存在(拒绝覆盖);备份只读业务数据,失败
+  不留下可被当作成功快照的输出。
+  restore 从快照整库恢复:先校验格式版本与完整性(不支持的版本、截断、
+  校验不符或不可读时不开始替换),再检查快照内容的结构和关联;三个业务
+  存储作为一次提交整体替换,成功后业务状态完全等于快照——快照为空的
+  部分清除原数据,快照之后新增的读数、请求和告警不保留;只替换业务
+  存储,目录内其他文件保持不变;可用于当前存储已损坏的目录(不要求
+  原库能解析)。读写或重命名失败保留恢复前全部状态;提交中断后,任一
+  命令再次启动会先恢复为完整旧状态或完整快照状态,无法完成时明确报错。
+  恢复不自动评估或重新生成历史,成功报告恢复的数据及历史数量。
+  备份与恢复均检查三个业务存储的结构和关联:全库重复读数身份、修正项
+  引用缺失读数、撤销引用缺失修正、成员或规则目标不存在、告警引用缺失
+  规则,指出原因并拒绝。命令执行期间持有数据目录锁,不与其他进程同时
+  读写同一目录。
 
 数据位置:
   $METERWATCH_DATA_DIR/readings.json(默认 ~/.meterwatch/readings.json;
@@ -537,17 +562,7 @@ function cmdUndoEntry(rest: string[]): number {
   return cmdUndo(requestId, targetId);
 }
 
-function main(args: string[]): number {
-  if (args.length === 0) {
-    console.log(help);
-    return 0;
-  }
-  const [cmd, ...rest] = args;
-  if (rest.length === 0 && (cmd === '--help' || cmd === '-h')) {
-    console.log(help);
-    return 0;
-  }
-
+function dispatch(cmd: string, rest: string[]): number {
   if (cmd === 'import') {
     if (rest.length !== 1) return usageError("'import' 需要且仅需要一个 CSV 文件路径");
     return cmdImport(rest[0]);
@@ -597,7 +612,55 @@ function main(args: string[]): number {
     return cmdAck(alertId);
   }
 
+  if (cmd === 'backup') {
+    if (rest.length !== 1) return usageError("'backup' 需要且仅需要一个快照文件路径(必须位于数据目录之外)");
+    if (rest[0].trim() === '') return usageError('快照文件路径不能为空');
+    return cmdBackup(rest[0]);
+  }
+
+  if (cmd === 'restore') {
+    if (rest.length !== 1) return usageError("'restore' 需要且仅需要一个快照文件路径(必须位于数据目录之外)");
+    if (rest[0].trim() === '') return usageError('快照文件路径不能为空');
+    return cmdRestore(rest[0]);
+  }
+
   return usageError(`无法识别的参数 '${cmd}'`);
+}
+
+function main(args: string[]): number {
+  if (args.length === 0) {
+    console.log(help);
+    return 0;
+  }
+  const [cmd, ...rest] = args;
+  if (rest.length === 0 && (cmd === '--help' || cmd === '-h')) {
+    console.log(help);
+    return 0;
+  }
+
+  // 执行期间不与其他进程读写同一数据目录:先取目录锁。
+  let lock;
+  try {
+    lock = acquireLock();
+  } catch (e) {
+    console.error(`${name}: cannot lock the data directory: ${(e as Error).message}`);
+    return 1;
+  }
+  if (lock === null) {
+    console.error(`${name}: another meterwatch process is using the data directory; try again later`);
+    return 1;
+  }
+  try {
+    // 上次恢复提交若被中断,先恢复为完整旧状态或完整快照状态。
+    const recoveryError = recoverInterruptedRestore();
+    if (recoveryError !== null) {
+      console.error(`${name}: ${recoveryError}`);
+      return 1;
+    }
+    return dispatch(cmd, rest);
+  } finally {
+    lock.release();
+  }
 }
 
 process.exitCode = main(process.argv.slice(2));

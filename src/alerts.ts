@@ -86,7 +86,7 @@ export interface AlertRecord {
   events: AlertEvent[];
 }
 
-interface AlertState {
+export interface AlertState {
   nextAlertNum: number;
   nextEventSeq: number;
   rules: AlertRule[];
@@ -97,7 +97,7 @@ function err(message: string): void {
   console.error(`meterwatch: ${message}`);
 }
 
-function emptyState(): AlertState {
+export function emptyAlertState(): AlertState {
   return { nextAlertNum: 1, nextEventSeq: 1, rules: [], alerts: [] };
 }
 
@@ -106,15 +106,8 @@ function targetLabel(rule: Pick<AlertRule, 'targetType' | 'targetId'>): string {
   return `${rule.targetType}=${rule.targetId}`;
 }
 
-/** 读取告警存储;文件不存在返回空状态,存在但无法读取或内容损坏抛出 StoreError。 */
-function loadAlertState(path: string): AlertState {
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState();
-    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
-  }
+/** 解析告警存储文本;内容损坏抛出 StoreError,消息中含 path 便于定位。 */
+export function parseAlertStateJson(text: string, path: string): AlertState {
   let data: unknown;
   try {
     data = JSON.parse(text);
@@ -192,7 +185,6 @@ function loadAlertState(path: string): AlertState {
       typeof a.id === 'string' &&
       a.id.length > 0 &&
       typeof a.ruleId === 'string' &&
-      ruleIds.has(a.ruleId) &&
       typeof a.date === 'string' &&
       DATE_RE.test(a.date) &&
       (a.status === 'triggered' || a.status === 'recovered') &&
@@ -200,6 +192,9 @@ function loadAlertState(path: string): AlertState {
       Array.isArray(a.events) &&
       (a.events as unknown[]).length > 0;
     if (!ok) throw bad('invalid alert entry');
+    if (!ruleIds.has(a.ruleId as string)) {
+      throw bad(`alert '${a.id}' references missing rule '${a.ruleId}'`);
+    }
     if (alertIds.has(a.id)) throw bad(`duplicate alert id '${a.id}'`);
     alertIds.add(a.id);
     const seqs = new Set<number>();
@@ -225,14 +220,21 @@ function loadAlertState(path: string): AlertState {
   };
 }
 
-/**
- * 原子写入告警存储;失败抛错,原有数据保持不变。
- * 告警写入不触碰读数与成员版本文件。
- */
-function saveAlertState(path: string, state: AlertState): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}`;
-  const body =
+/** 读取告警存储;文件不存在返回空状态,存在但无法读取或内容损坏抛出 StoreError。 */
+function loadAlertState(path: string): AlertState {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyAlertState();
+    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
+  }
+  return parseAlertStateJson(text, path);
+}
+
+/** 序列化告警存储;阈值以十进制字符串保存,规则含目标类型与规范时区名。 */
+export function serializeAlertState(state: AlertState): string {
+  return (
     JSON.stringify(
       {
         version: 2,
@@ -247,7 +249,18 @@ function saveAlertState(path: string, state: AlertState): void {
       },
       null,
       2,
-    ) + '\n';
+    ) + '\n'
+  );
+}
+
+/**
+ * 原子写入告警存储;失败抛错,原有数据保持不变。
+ * 告警写入不触碰读数与成员版本文件。
+ */
+function saveAlertState(path: string, state: AlertState): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}`;
+  const body = serializeAlertState(state);
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);
