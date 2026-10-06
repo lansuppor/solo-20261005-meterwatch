@@ -2,9 +2,10 @@ import { cmdImport, cmdReadings, CSV_HEADER } from './src/commands.ts';
 import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
-import { cmdGroupScheduleReport } from './src/schedule.ts';
+import { cmdGroupScheduleReport, parseSchedule, type ScheduleWindow } from './src/schedule.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
 import { cmdBackup, cmdRestore, withDirectoryCoordination } from './src/backup.ts';
+import { readFileSync } from 'node:fs';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -23,8 +24,9 @@ Usage:
   node app.ts readings [筛选...]    查询读数、区间与消耗
   node app.ts daily --from <iso> --to <iso> [--device <id>...] [--tz <时区>] [--max-interval <秒>]
                                     按当地自然日核查能耗的只读日报(默认 UTC 分日)
-  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh> [--tz <时区>] [--max-interval <秒>]
-                                    创建每日能耗阈值告警规则(设备或分组,时区省略为 UTC)
+  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh> [--tz <时区>] [--max-interval <秒>] [--schedule <时间表文件>]
+                                    创建每日能耗阈值告警规则(设备或分组,时区省略为 UTC;
+                                    --schedule 仅分组规则:指定为非运行模式,省略为全天模式)
   node app.ts rule list             查看全部告警规则
   node app.ts evaluate --rule <id> --from <日期> --to <日期>
                                     评估规则在连续完整当地日期(按规则时区)上的超限情况
@@ -172,7 +174,9 @@ Usage:
   下一日(尾段沿用开始日规则,周日可跨至周一)。窗口起点含、终点不含,
   重叠或重复取并集;零个窗口(空表)表示全部非运行。窗口按实际时刻的
   当地日期与墙钟分类,每秒只属一类:夏令时跳过时段不虚构覆盖,回拨重复
-  时段各自分类,不套固定偏移或日长。
+  时段各自分类,不套固定偏移或日长。group schedule-report 的 --schedule
+  与 rule create 的 --schedule 共用本格式;后者在创建时保存解析结果,
+  原文件后续变化不影响已建规则。
 
 修正与撤销(correct / undo / corrections):
   correct 一次提交指定非空请求标识(--request,去首尾空白、区分大小写,在
@@ -221,9 +225,28 @@ Usage:
   及同间隔限制重试成功且不重复创建,任一不同即报冲突。规则限制与列表
   显示重启后保留,备份恢复完整保留;旧规则与旧快照未设置限制时按无上限
   使用,已存非法限制按损坏数据拒绝。
+  分组规则创建时可加 --schedule <时间表文件> 指定本地每周运行时间表
+  (格式见上文"时间表文件格式",与 group schedule-report 相同;非法时间
+  表返回 2,文件不可读返回 1):指定即为非运行模式,每天只取该日期全部
+  实际时段中的非运行部分核查停运消耗;省略为全天模式。设备规则不接受
+  时间表。创建时保存解析后的时间表,原文件后续修改、移动或删除不影响
+  规则;模式与时间表创建后固定,标识在全天与非运行模式间统一唯一。
+  同标识重试比较模式与每周运行窗口并集(不比较文件路径;窗口顺序、
+  重复及等价拆分不影响等价性),其余参数比较不变,任一不同即报冲突且
+  保持状态。非运行模式的创建与同参重试都检查所用存储与全库重复读数
+  身份。非运行模式评估:每天先取归属该日期的全部实际 UTC 时段,再取
+  其中的非运行部分(回拨重复小时各自分类,日期回退的不连续时段合并,
+  跳过时段不虚构);整日被跳过或没有非运行秒数的日期说明原因,不触发
+  也不恢复。仅非运行部分全部有效才与阈值比较,运行部分的异常或未知
+  不阻止判定;非运行部分有异常或未知则不可判定;零增长有效,严格大于
+  阈值才超限。评估与历史显示当天非运行 UTC 时段与有效/异常/未知秒数
+  (采用限制时另显示过长间隔未知秒数),覆盖合计等于当天非运行时长;
+  触发与恢复记录的消耗为当时的非运行值,不随后续数据改写。规则列表
+  显示模式与固定时间表;旧规则与旧快照未设置模式时按全天模式,已存
+  非法模式或时间表按损坏数据拒绝。
   evaluate 与 alerts 的 --from/--to 为 YYYY-MM-DD 的当地日期(按规则时区
   解释),起日含、止日不含,起日必须更早。每个日期统计归属该日期的全部实际
-  UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨重复小时完整
+  UTC 时段(非运行模式只取其中的非运行部分),不把当地午夜套用固定偏移:夏令时短日不补未知,回拨重复小时完整
   计入,日期回退的不连续时段合并为同一天、一次评估只作一次判定;整日被跳过
   的日期标明跳过,不判定、不创建也不恢复告警。设备规则评估口径与 daily 相同;
   分组规则与 group daily 的联合覆盖口径相同:每天按当时生效的成员版本计算,
@@ -395,7 +418,7 @@ function cmdRule(rest: string[]): number {
     return cmdRuleList();
   }
   if (sub === 'create') {
-    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold', '--tz', '--max-interval']);
+    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold', '--tz', '--max-interval', '--schedule']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
     const deviceList = flags.get('--device');
@@ -403,6 +426,7 @@ function cmdRule(rest: string[]): number {
     const thresholdRaw = oneFlag(flags, '--threshold');
     const tzList = flags.get('--tz');
     const maxIntervalList = flags.get('--max-interval');
+    const scheduleList = flags.get('--schedule');
     if (idRaw === null || thresholdRaw === null) {
       return usageError("'rule create' 需要 --id 与 --threshold 各恰好一个");
     }
@@ -412,6 +436,9 @@ function cmdRule(rest: string[]): number {
     if (maxIntervalList !== undefined && maxIntervalList.length !== 1) {
       return usageError("'rule create' 的 --max-interval 只能出现一次");
     }
+    if (scheduleList !== undefined && scheduleList.length !== 1) {
+      return usageError("'rule create' 的 --schedule 只能出现一次");
+    }
     const hasDevice = deviceList !== undefined;
     const hasGroup = groupList !== undefined;
     if (hasDevice === hasGroup) {
@@ -420,6 +447,9 @@ function cmdRule(rest: string[]): number {
     if ((deviceList !== undefined && deviceList.length !== 1) ||
       (groupList !== undefined && groupList.length !== 1)) {
       return usageError("'rule create' 的目标选项只能出现一次");
+    }
+    if (hasDevice && scheduleList !== undefined) {
+      return usageError("设备规则不接受时间表:'rule create' 的 --schedule 仅用于分组规则");
     }
     const id = idRaw.trim();
     if (id === '') return usageError('规则标识不能为空');
@@ -447,14 +477,36 @@ function cmdRule(rest: string[]): number {
       }
       maxInterval = parsed;
     }
+    // 可选的每周运行时间表(仅分组规则):指定为非运行模式,省略为全天模式。
+    // 创建时保存解析后的时间表,原文件后续修改、移动或删除不影响规则。
+    let mode: 'all-day' | 'non-running' = 'all-day';
+    let schedule: ScheduleWindow[] | undefined;
+    if (scheduleList !== undefined) {
+      const schedulePath = scheduleList[0];
+      if (schedulePath.trim() === '') return usageError("'--schedule' 的值不能为空");
+      let text: string;
+      try {
+        text = readFileSync(schedulePath, 'utf8');
+      } catch (e) {
+        console.error(`meterwatch: cannot read schedule file ${schedulePath}: ${(e as Error).message}`);
+        return 1;
+      }
+      const parsed = parseSchedule(text);
+      if (typeof parsed === 'string') {
+        console.error(`meterwatch: invalid schedule file ${schedulePath}: ${parsed}`);
+        return 2;
+      }
+      mode = 'non-running';
+      schedule = parsed;
+    }
     if (hasDevice) {
       const device = (deviceList as string[])[0].trim();
       if (device === '') return usageError("'--device' 的值不能为空");
-      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli, tz, maxInterval });
+      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli, tz, maxInterval, mode });
     }
     const group = (groupList as string[])[0].trim();
     if (group === '') return usageError("'--group' 的值不能为空");
-    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli, tz, maxInterval });
+    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli, tz, maxInterval, mode, schedule });
   }
   if (sub === undefined) return usageError("'rule' 需要子命令 create 或 list");
   return usageError(`无法识别的 rule 子命令 '${sub}'`);
