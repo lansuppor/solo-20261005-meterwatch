@@ -56,6 +56,19 @@ const DOW_BY_NAME: Record<string, number> = {
   sat: 6,
 };
 
+/** 星期序号的显示名(0=周日 .. 6=周六)。 */
+const DOW_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+/** 一周分钟数(7 * 1440)。 */
+const WEEK_MINUTES = 7 * 1440;
+
+/**
+ * 单个窗口相对开始日的最大结束分钟(两天):分类只对每个当地日期回看
+ * 上一日开始的窗口,故规范形窗口最长跨至下一日结束,更长的时间段必须
+ * 拆成多个窗口表示。
+ */
+const MAX_WINDOW_END_MIN = 2 * 1440;
+
 /** 解析 HH:mm 为当日分钟数;allow24 时另接受 24:00(=1440)。无效返回 null。 */
 function parseHm(raw: string, allow24: boolean): number | null {
   const m = /^(\d{2}):(\d{2})$/.exec(raw);
@@ -108,6 +121,90 @@ export function parseSchedule(text: string): ScheduleWindow[] | string {
     windows.push({ startDow: dow, startMin: start, endMin });
   }
   return windows;
+}
+
+/**
+ * 把每周运行窗口规范化为并集的最简形式:按周分钟(0..10079)展开为覆盖
+ * 集合(结束越过周界的窗口取模回卷),再合并为按周分钟升序、互不重叠、
+ * 互不相邻的窗口列表;超过两天的连续覆盖按每个窗口最多跨至下一日结束
+ * 切分(分类只回看上一日开始的窗口)。窗口顺序、重复与等价拆分(如
+ * mon 08:00-12:00 加 mon 12:00-18:00 对比 mon 08:00-18:00)不影响规范形,
+ * 故规范形相同当且仅当每周运行窗口的并集相同。空表(零个窗口)的规范形
+ * 为空数组。
+ */
+export function canonicalizeWindows(windows: ScheduleWindow[]): ScheduleWindow[] {
+  const covered = new Uint8Array(WEEK_MINUTES);
+  for (const w of windows) {
+    const s = w.startDow * 1440 + w.startMin;
+    const e = w.startDow * 1440 + w.endMin;
+    for (let m = s; m < e; m++) covered[m % WEEK_MINUTES] = 1;
+  }
+  const out: ScheduleWindow[] = [];
+  let m = 0;
+  while (m < WEEK_MINUTES) {
+    if (covered[m] === 0) {
+      m++;
+      continue;
+    }
+    const s = m;
+    while (m < WEEK_MINUTES && covered[m] === 1) m++;
+    // 连续覆盖段 [s, m):切成每个窗口最多跨至下一日结束(分类只回看一天)。
+    let cur = s;
+    while (cur < m) {
+      const startDow = Math.floor(cur / 1440);
+      const end = Math.min(m, startDow * 1440 + MAX_WINDOW_END_MIN);
+      out.push({ startDow, startMin: cur - startDow * 1440, endMin: end - startDow * 1440 });
+      cur = end;
+    }
+  }
+  return out;
+}
+
+/**
+ * 时间表的展示形式:`dow HH:mm-HH:mm` 列表(逗号分隔);结束可跨夜,
+ * 小时可大于 24(相对开始日)。零个窗口显示为 `(no running windows)`。
+ */
+export function formatSchedule(windows: ScheduleWindow[]): string {
+  if (windows.length === 0) return '(no running windows)';
+  const hm = (min: number): string =>
+    `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+  return windows
+    .map((w) => `${DOW_NAMES[w.startDow]} ${hm(w.startMin)}-${hm(w.endMin)}`)
+    .join(', ');
+}
+
+/**
+ * 解析存储中的时间表字段(窗口数组,元素为 {startDow, startMin, endMin}):
+ * startDow 0..6,startMin 0..1439,endMin 大于 startMin 且不超过两天(规范
+ * 形窗口最多跨至下一日结束,与分类的回看口径一致)。非法返回 null,由
+ * 调用方按损坏数据处理。
+ */
+export function validateStoredSchedule(value: unknown): ScheduleWindow[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: ScheduleWindow[] = [];
+  for (const w of value) {
+    if (w === null || typeof w !== 'object') return null;
+    const o = w as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(o.startDow) ||
+      (o.startDow as number) < 0 ||
+      (o.startDow as number) > 6 ||
+      !Number.isSafeInteger(o.startMin) ||
+      (o.startMin as number) < 0 ||
+      (o.startMin as number) > 1439 ||
+      !Number.isSafeInteger(o.endMin) ||
+      (o.endMin as number) <= (o.startMin as number) ||
+      (o.endMin as number) > MAX_WINDOW_END_MIN
+    ) {
+      return null;
+    }
+    out.push({
+      startDow: o.startDow as number,
+      startMin: o.startMin as number,
+      endMin: o.endMin as number,
+    });
+  }
+  return out;
 }
 
 interface Period {

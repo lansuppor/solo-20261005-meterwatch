@@ -14,6 +14,21 @@
 // 目标类型、同目标标识、等价阈值、同时区及同间隔限制重试成功且不重复创建,
 // 任一不同即报冲突。
 //
+// 分组规则另可在创建时用 --schedule 指定本地每周运行时间表(格式与
+// group schedule-report 相同),成为非运行时段告警规则;省略为全天模式,
+// 设备规则不接受时间表。创建时把解析后的时间表规范形(每周运行窗口并集)
+// 保存在规则内,原文件后续修改、移动或删除不影响规则;时间表与目标、阈值、
+// 时区、采样限制一样创建后固定。同标识重试比较模式及每周运行窗口并集
+// (不比较文件路径;窗口顺序、重复及等价拆分不影响等价性),其余参数沿用
+// 原比较规则,任一不同即报冲突。非运行模式每天只取该日期全部实际时段中的
+// 非运行部分参与判定:非运行时段全部有效才比较合计消耗(运行时段的异常或
+// 未知不阻止判定),严格超阈值才触发,零增长有效;非运行部分有异常或未知
+// 则不可判定,不触发也不恢复;没有非运行秒数的日期说明原因,不判定、不
+// 触发也不恢复。评估与历史显示非运行 UTC 时段、当前消耗与有效/异常/未知
+// (及过长间隔未知)秒数,覆盖合计等于当天非运行时长;触发与恢复记录的
+// 消耗为非运行值。列表显示模式及固定时间表;旧规则与旧快照按全天模式,
+// 非法已存模式或时间表按损坏数据拒绝。
+//
 // - 评估针对连续完整的当地日期(起日含、止日不含)。每个日期统计归属该日期的
 //   全部实际 UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨
 //   重复小时完整计入,日期回退的不连续时段合并为同一天、一次评估只作一次
@@ -49,8 +64,15 @@ import {
 } from './store.ts';
 import { computeDay, DAY_SECONDS, formatGapLine, maxIntervalText, mergeGaps, type DayStats, type GapDetail } from './report.ts';
 import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group } from './groups.ts';
+import {
+  canonicalizeWindows,
+  classifyPeriods,
+  formatSchedule,
+  validateStoredSchedule,
+  type ScheduleWindow,
+} from './schedule.ts';
 import { formatIsoUtc, parseUtcDate } from './time.ts';
-import { canonicalTimezone, loadTimezone, localDateRange, type LocalDay } from './tz.ts';
+import { canonicalTimezone, loadTimezone, localDateRange, type LocalDay, type LocalDayPeriod } from './tz.ts';
 import { formatKwh } from './value.ts';
 
 export type RuleTargetType = 'device' | 'group';
@@ -68,6 +90,10 @@ export interface AlertRule {
   tz: string;
   /** 最大采样间隔限制(正整数秒);省略表示无上限。创建后固定。 */
   maxInterval?: number;
+  /** 非运行模式的固定每周运行时间表(规范形:并集合并后的窗口,按周分钟
+   *  升序);省略表示全天模式。仅分组规则可带,创建时保存解析结果,与原
+   *  时间表文件后续变化无关;创建后固定。 */
+  schedule?: ScheduleWindow[];
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -110,6 +136,35 @@ function emptyState(): AlertState {
 /** 目标在输出中的显示形式,如 device=meter-1 / group=floor-1。 */
 function targetLabel(rule: Pick<AlertRule, 'targetType' | 'targetId'>): string {
   return `${rule.targetType}=${rule.targetId}`;
+}
+
+/** 规则模式:带固定时间表的分组规则为非运行模式,否则为全天模式。 */
+function ruleMode(rule: Pick<AlertRule, 'schedule'>): 'all-day' | 'non-running' {
+  return rule.schedule === undefined ? 'all-day' : 'non-running';
+}
+
+/** 模式与固定时间表的显示形式(非运行模式附规范形窗口列表)。 */
+function modeText(rule: Pick<AlertRule, 'schedule'>): string {
+  return rule.schedule === undefined
+    ? 'mode=all-day'
+    : `mode=non-running schedule=${formatSchedule(rule.schedule)}`;
+}
+
+/**
+ * 每周运行窗口并集等价性:两边都取规范形后逐窗口比较。窗口顺序、重复及
+ * 等价拆分不影响等价性;不比较任何文件路径。两边都省略(全天模式)才相等。
+ */
+function scheduleEquals(a?: ScheduleWindow[], b?: ScheduleWindow[]): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  const ca = canonicalizeWindows(a);
+  const cb = canonicalizeWindows(b);
+  return (
+    ca.length === cb.length &&
+    ca.every(
+      (w, i) =>
+        w.startDow === cb[i].startDow && w.startMin === cb[i].startMin && w.endMin === cb[i].endMin,
+    )
+  );
 }
 
 /**
@@ -183,9 +238,33 @@ export function parseAlertState(data: unknown, source: string): AlertState {
       }
       maxInterval = r.maxInterval as number;
     }
+    // 模式与时间表:新版字段 mode/schedule;旧版无该字段的规则按全天模式
+    // 使用。非法已存模式或时间表按损坏数据拒绝;非运行模式只适用于分组
+    // 规则,全天模式不得带时间表。
+    const mode = r.mode === undefined ? 'all-day' : r.mode;
+    if (mode !== 'all-day' && mode !== 'non-running') {
+      throw bad(`invalid mode in rule '${r.id}'`);
+    }
+    let schedule: ScheduleWindow[] | undefined;
+    if (mode === 'non-running') {
+      if (targetType !== 'group') throw bad(`non-running mode on device rule '${r.id}'`);
+      const parsed = validateStoredSchedule(r.schedule);
+      if (parsed === null) throw bad(`invalid schedule in rule '${r.id}'`);
+      schedule = parsed;
+    } else if (r.schedule !== undefined) {
+      throw bad(`unexpected schedule in all-day rule '${r.id}'`);
+    }
     if (ruleIds.has(r.id)) throw bad(`duplicate rule id '${r.id}'`);
     ruleIds.add(r.id);
-    rules.push({ id: r.id, targetType, targetId, thresholdMilli: thresholdMilli as bigint, tz, maxInterval });
+    rules.push({
+      id: r.id,
+      targetType,
+      targetId,
+      thresholdMilli: thresholdMilli as bigint,
+      tz,
+      maxInterval,
+      schedule,
+    });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -260,6 +339,7 @@ export function serializeAlertState(state: AlertState): Record<string, unknown> 
       thresholdMilli: r.thresholdMilli.toString(),
       tz: r.tz,
       ...(r.maxInterval !== undefined ? { maxInterval: r.maxInterval } : {}),
+      ...(r.schedule !== undefined ? { mode: 'non-running', schedule: r.schedule } : {}),
     })),
   };
 }
@@ -340,8 +420,8 @@ function coverageSuffix(
 }
 
 /** 一天各实际 UTC 时段的展示行(时段按实际时刻升序)。 */
-function periodLines(day: LocalDay): string[] {
-  return day.periods.map((p) => `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+function periodLines(periods: LocalDayPeriod[]): string[] {
+  return periods.map((p) => `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
 }
 
 /** 一天内过长区间明细的展示行(指出相关设备与原始相邻读数时刻)。 */
@@ -359,19 +439,35 @@ function ruleFormat(rule: AlertRule): Intl.DateTimeFormat {
 }
 
 /**
- * 计算规则在一个当地日期上的统计:汇总归属该日期的全部实际 UTC 时段。
+ * 规则在一个当地日期上实际参与判定的 UTC 时段:全天模式为该日期的全部
+ * 实际时段;非运行模式为这些时段按规则固定的每周运行时间表分类后的非
+ * 运行部分(分类沿用 group schedule-report 的口径:按实际时刻的当地日期
+ * 与墙钟,回拨重复小时各自分类,跳过时段不虚构)。同一日期的不连续时段
+ * 分别分类后合并在同一日期下参与一次判定。
+ */
+function ruleDayPeriods(rule: AlertRule, fmt: Intl.DateTimeFormat, day: LocalDay): LocalDayPeriod[] {
+  if (rule.schedule === undefined) return day.periods;
+  const out: LocalDayPeriod[] = [];
+  for (const p of day.periods) {
+    out.push(...classifyPeriods(fmt, p.start, p.end, rule.schedule).nonRunning);
+  }
+  return out;
+}
+
+/**
+ * 计算规则在给定 UTC 时段集合上的统计(这些时段属于同一当地日期)。
  * 设备规则用 daily 口径,分组规则用 group daily 的联合覆盖口径;
- * 日界线与成员切换都不重置各设备原读数区间的分摊起点。
+ * 日界线、时间表边界与成员切换都不重置各设备原读数区间的分摊起点。
  * maxInterval 为规则固定的采样间隔限制(省略为无上限)。
  */
-function computeRuleDay(env: RuleEnv, day: LocalDay, maxInterval?: number): DayStats {
+function computeRuleDay(env: RuleEnv, periods: LocalDayPeriod[], maxInterval?: number): DayStats {
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
   let gapUnknown = 0;
   const gaps: GapDetail[] = [];
   let consumption = 0n;
-  for (const p of day.periods) {
+  for (const p of periods) {
     if (env.kind === 'device') {
       const s = computeDay(env.series, p.start, p.end, maxInterval);
       valid += s.valid;
@@ -394,9 +490,11 @@ function computeRuleDay(env: RuleEnv, day: LocalDay, maxInterval?: number): DayS
 }
 
 /**
- * 创建规则。相同标识、同目标类型、同目标标识、等价阈值、同时区(规范名)
- * 及同采样间隔限制重试成功且不重复创建;任一不同即报冲突。设备必须已有
- * 存储读数;分组必须已配置。返回进程退出码。
+ * 创建规则。相同标识、同目标类型、同目标标识、等价阈值、同时区(规范名)、
+ * 同采样间隔限制及同模式(非运行模式比较每周运行窗口并集,不比较文件路径)
+ * 重试成功且不重复创建;任一不同即报冲突。设备必须已有存储读数;分组必须
+ * 已配置。非运行模式(带固定时间表,仅分组规则)的创建与同参重试都先检查
+ * 所用存储与全库重复读数身份。返回进程退出码。
  */
 export function cmdRuleCreate(opts: {
   id: string;
@@ -407,6 +505,9 @@ export function cmdRuleCreate(opts: {
   tz: string;
   /** 最大采样间隔限制(正整数秒);省略表示无上限,创建后固定。 */
   maxInterval?: number;
+  /** 非运行模式的每周运行时间表(已解析并规范化的窗口并集);省略为全天
+   *  模式。仅分组规则可带;创建时保存解析结果,与原文件后续变化无关。 */
+  schedule?: ScheduleWindow[];
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -420,6 +521,22 @@ export function cmdRuleCreate(opts: {
     throw e;
   }
 
+  // 非运行模式:新模式创建与同参重试都先检查所用存储(分组、读数)及全库
+  // 重复读数身份,再比较参数或写入。
+  let groups: Group[] | undefined;
+  if (opts.schedule !== undefined) {
+    try {
+      groups = loadGroups(groupFilePath());
+      loadCheckedSeriesByDevice(loadStore(dataFilePath()));
+    } catch (e) {
+      if (e instanceof StoreError) {
+        err(e.message);
+        return 1;
+      }
+      throw e;
+    }
+  }
+
   const got = `${opts.targetType}=${opts.targetId}`;
   const existing = state.rules.find((r) => r.id === opts.id);
   if (existing) {
@@ -428,21 +545,22 @@ export function cmdRuleCreate(opts: {
       existing.targetId === opts.targetId &&
       existing.thresholdMilli === opts.thresholdMilli &&
       existing.tz === opts.tz &&
-      existing.maxInterval === opts.maxInterval
+      existing.maxInterval === opts.maxInterval &&
+      scheduleEquals(existing.schedule, opts.schedule)
     ) {
       console.log(
         `rule '${opts.id}' already exists with identical parameters (${targetLabel(existing)} ` +
           `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz} ` +
-          `max-interval=${maxIntervalText(existing.maxInterval)}); unchanged`,
+          `max-interval=${maxIntervalText(existing.maxInterval)} ${modeText(existing)}); unchanged`,
       );
       return 0;
     }
     err(
       `rule '${opts.id}' already exists with different parameters ` +
         `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh ` +
-        `tz=${existing.tz} max-interval=${maxIntervalText(existing.maxInterval)}, ` +
+        `tz=${existing.tz} max-interval=${maxIntervalText(existing.maxInterval)} ${modeText(existing)}, ` +
         `got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
-        `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)}); conflict`,
+        `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)} ${modeText(opts)}); conflict`,
     );
     return 1;
   }
@@ -456,8 +574,8 @@ export function cmdRuleCreate(opts: {
         return 1;
       }
     } else {
-      const groups = loadGroups(groupFilePath());
-      if (!groups.some((g) => g.id === opts.targetId)) {
+      const known = groups ?? loadGroups(groupFilePath());
+      if (!known.some((g) => g.id === opts.targetId)) {
         err(`unknown group '${opts.targetId}': configure the group before creating a rule`);
         return 1;
       }
@@ -477,6 +595,7 @@ export function cmdRuleCreate(opts: {
     thresholdMilli: opts.thresholdMilli,
     tz: opts.tz,
     maxInterval: opts.maxInterval,
+    schedule: opts.schedule,
   });
   try {
     saveAlertState(statePath, state);
@@ -489,12 +608,12 @@ export function cmdRuleCreate(opts: {
   }
   console.log(
     `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
-      `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)}`,
+      `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)} ${modeText(opts)}`,
   );
   return 0;
 }
 
-/** 列出全部规则(含目标类型、时区与采样间隔限制)。只读。返回进程退出码。 */
+/** 列出全部规则(含目标类型、时区、采样间隔限制、模式及固定时间表)。只读。返回进程退出码。 */
 export function cmdRuleList(): number {
   let state: AlertState;
   try {
@@ -515,7 +634,7 @@ export function cmdRuleList(): number {
     const open = state.alerts.filter((a) => a.ruleId === r.id && a.status === 'triggered').length;
     console.log(
       `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  ` +
-        `tz=${r.tz}  max-interval=${maxIntervalText(r.maxInterval)}  open alerts=${open}`,
+        `tz=${r.tz}  max-interval=${maxIntervalText(r.maxInterval)}  ${modeText(r)}  open alerts=${open}`,
     );
   }
   return 0;
@@ -525,8 +644,10 @@ export function cmdRuleList(): number {
  * 评估规则在连续完整当地日期范围 [from, to)(规则时区的 YYYY-MM-DD,起日含、
  * 止日不含)上的超限情况。每个日期统计归属该日期的全部实际 UTC 时段,一次
  * 评估只作一次判定;整日被跳过的日期标明跳过,不判定、不创建也不恢复告警。
- * 全部日期计算并应用到内存状态后一次性原子写入,不部分提交;中途任一存储
- * 或数据错误都在写入前抛出,操作前状态保留。返回进程退出码。
+ * 非运行模式的规则每天只取这些时段中的非运行部分参与判定(运行时段的异常
+ * 或未知不阻止判定);没有非运行秒数的日期标明原因,同样不判定、不创建也
+ * 不恢复。全部日期计算并应用到内存状态后一次性原子写入,不部分提交;中途
+ * 任一存储或数据错误都在写入前抛出,操作前状态保留。返回进程退出码。
  */
 export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }): number {
   const statePath = alertFilePath();
@@ -565,12 +686,23 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
       lines.push(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})  no alert action`);
       continue;
     }
-    const stats = computeRuleDay(env, day, rule.maxInterval);
+    // 全天模式为当天全部实际时段;非运行模式只取其中的非运行部分。
+    const periods = ruleDayPeriods(rule, fmt, day);
+    let periodSeconds = 0;
+    for (const p of periods) periodSeconds += p.end - p.start;
+    if (periodSeconds === 0) {
+      // 非运行模式且当天没有非运行秒数:说明原因,不判定、不触发也不恢复。
+      lines.push(
+        `  ${label}  NO NON-RUNNING COVERAGE (running windows cover the whole local date)  no alert action`,
+      );
+      continue;
+    }
+    const stats = computeRuleDay(env, periods, rule.maxInterval);
     const coverage = coverageSuffix(stats, limited);
     if (stats.unknown > 0 || stats.anomaly > 0) {
       // 有未知或下降覆盖:不可判定,不触发也不恢复。
       lines.push(`  ${label}  undecidable (${coverage})  no alert action`);
-      lines.push(...periodLines(day));
+      lines.push(...periodLines(periods));
       lines.push(...gapLines(stats, rule));
       continue;
     }
@@ -617,7 +749,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
         lines.push(`  ${label}  ${cmp}  NORMAL  no alert  ${coverage}`);
       }
     }
-    lines.push(...periodLines(day));
+    lines.push(...periodLines(periods));
   }
 
   try {
@@ -632,7 +764,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
 
   console.log(
     `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
-      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}`,
+      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}  ${modeText(rule)}`,
   );
   for (const line of lines) console.log(line);
   return 0;
@@ -680,7 +812,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
 
   console.log(
     `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
-      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}`,
+      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}  ${modeText(rule)}`,
   );
   if (labels.length === 0) {
     console.log(`  no alerts recorded for rule '${rule.id}'`);
@@ -701,18 +833,26 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
     if (day === null) {
       console.log(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})`);
     } else {
-      const stats = computeRuleDay(env, day, rule.maxInterval);
-      if (stats.unknown > 0 || stats.anomaly > 0) {
-        console.log(`  ${label}  undecidable (${coverageSuffix(stats, limited)})`);
+      // 全天模式为当天全部实际时段;非运行模式只取其中的非运行部分。
+      const periods = ruleDayPeriods(rule, fmt, day);
+      let periodSeconds = 0;
+      for (const p of periods) periodSeconds += p.end - p.start;
+      if (periodSeconds === 0) {
+        console.log(`  ${label}  NO NON-RUNNING COVERAGE (running windows cover the whole local date)`);
       } else {
-        const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
-        console.log(
-          `  ${label}  consumption=${formatKwh(stats.consumption)} kWh ` +
-            `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)  ${coverageSuffix(stats, limited)}`,
-        );
+        const stats = computeRuleDay(env, periods, rule.maxInterval);
+        if (stats.unknown > 0 || stats.anomaly > 0) {
+          console.log(`  ${label}  undecidable (${coverageSuffix(stats, limited)})`);
+        } else {
+          const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
+          console.log(
+            `  ${label}  consumption=${formatKwh(stats.consumption)} kWh ` +
+              `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)  ${coverageSuffix(stats, limited)}`,
+          );
+        }
+        for (const line of periodLines(periods)) console.log(line);
+        for (const line of gapLines(stats, rule)) console.log(line);
       }
-      for (const line of periodLines(day)) console.log(line);
-      for (const line of gapLines(stats, rule)) console.log(line);
     }
     const alerts = state.alerts
       .filter((a) => a.ruleId === rule.id && a.date === label)
