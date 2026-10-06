@@ -26,6 +26,7 @@ import { dataFilePath, groupFilePath, loadStore, StoreError, type Reading } from
 import { formatIsoUtc } from './time.ts';
 import { localDays, loadTimezone } from './tz.ts';
 import { formatKwh } from './value.ts';
+import { formatLimit, formatGapInterval, type GapInterval } from './interval.ts';
 
 export interface GroupVersion {
   /** 生效时刻(含),epoch 秒。 */
@@ -176,28 +177,43 @@ function floorIndex(series: Reading[], s: number): number {
   return ans;
 }
 
-type SliceKind = 'valid' | 'anomaly' | 'unknown';
+type SliceKind = 'valid' | 'anomaly' | 'unknown' | 'gap';
 
 /**
  * 单设备在片段 [s, e) 上的状态与消耗。片段完全落在同一读数区间内
- * (调用方保证切点包含区间内全部读数时刻)。非下降区间以区间起点累计
- * 比例向下取整,消耗为两端累计量之差;下降区间为异常;首条读数之前、
- * 末条之后及孤立读数时段为未知,不外推。
+ * (调用方保证切点包含区间内全部读数时刻)。非下降且未超长的区间以区间
+ * 起点累计比例向下取整,消耗为两端累计量之差;下降区间为异常(即使也
+ * 超长);非下降但相邻读数实际时间差超过限制为 gap(整个区间未知,不
+ * 分摊);首条读数之前、末条之后及孤立读数时段为未知,不外推。
  */
 function deviceSlice(
   series: Reading[],
   s: number,
   e: number,
-): { kind: SliceKind; consumption: bigint } {
+  maxGapSeconds?: number,
+): { kind: SliceKind; consumption: bigint; gap: GapInterval | null } {
   const i = floorIndex(series, s);
-  if (i < 0 || i + 1 >= series.length) return { kind: 'unknown', consumption: 0n };
+  if (i < 0 || i + 1 >= series.length) return { kind: 'unknown', consumption: 0n, gap: null };
   const a = series[i];
   const b = series[i + 1];
   const diff = b.milli - a.milli;
-  if (diff < 0n) return { kind: 'anomaly', consumption: 0n };
+  if (diff < 0n) return { kind: 'anomaly', consumption: 0n, gap: null };
+  // 时间差按完整时序相邻读数判定:成员切换边界不裁短它。
+  if (maxGapSeconds !== undefined && b.ts - a.ts > maxGapSeconds) {
+    return {
+      kind: 'gap',
+      consumption: 0n,
+      gap: { prevTs: a.ts, nextTs: b.ts, duration: b.ts - a.ts },
+    };
+  }
   const duration = BigInt(b.ts - a.ts);
   const cumulative = (t: number): bigint => (diff * BigInt(t - a.ts)) / duration;
-  return { kind: 'valid', consumption: cumulative(e) - cumulative(s) };
+  return { kind: 'valid', consumption: cumulative(e) - cumulative(s), gap: null };
+}
+
+/** 分组统计中的过长间隔来源:设备 + 原始相邻读数时刻。 */
+export interface GroupGap extends GapInterval {
+  device: string;
 }
 
 export interface GroupPeriod {
@@ -210,27 +226,34 @@ export interface GroupPeriod {
 }
 
 export interface GroupSegmentStats {
-  /** 有效(全部成员非下降)覆盖秒数,按分组实际时间计。 */
+  /** 有效(全部成员非下降且未超长)覆盖秒数,按分组实际时间计。 */
   valid: number;
-  /** 异常(任一成员下降)覆盖秒数。 */
+  /** 异常(任一成员下降)覆盖秒数;下降优先,即使该成员间隔也超长。 */
   anomaly: number;
-  /** 未知(无生效版本或任一成员未知)覆盖秒数。 */
+  /** 未知(无生效版本、任一成员未知或任一成员非下降区间超长)覆盖秒数。 */
   unknown: number;
+  /** 其中因成员过长间隔落在最终未知时段内的秒数(按分组时间并集,不叠加成员)。 */
+  gapUnknown: number;
   /** 有效时段内全部生效成员的分摊消耗之和,毫千瓦时 BigInt。 */
   consumption: bigint;
   /** 段内按生效时刻切分的成员时段。 */
   periods: GroupPeriod[];
+  /** 与该段相交的成员过长间隔(按设备与区间去重),用于结果展示。 */
+  gapIntervals: GroupGap[];
 }
 
 /**
  * 计算分组在 [segStart, segEnd) 上的覆盖与消耗。
  * versions 按生效时刻升序;seriesByDevice 含全部版本成员的完整时序。
+ * maxGapSeconds 省略表示无上限;任一成员下降优先记异常,否则任一成员
+ * (普通)未知或过长便记未知,全部可信才计成员消耗之和。
  */
 export function computeGroupSegment(
   versions: GroupVersion[],
   seriesByDevice: Map<string, Reading[]>,
   segStart: number,
   segEnd: number,
+  maxGapSeconds?: number,
 ): GroupSegmentStats {
   // 按版本生效时刻把段切成成员恒定的时段;首个版本生效前 members 为 null。
   const periods: GroupPeriod[] = [];
@@ -251,7 +274,9 @@ export function computeGroupSegment(
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
+  let gapUnknown = 0;
   let consumption = 0n;
+  const gapByKey = new Map<string, GroupGap>();
   for (const p of periods) {
     if (p.members === null) {
       unknown += p.end - p.start;
@@ -271,23 +296,46 @@ export function computeGroupSegment(
       let anyAnomaly = false;
       let anyUnknown = false;
       let slice = 0n;
+      const sliceGaps: Array<{ device: string; gap: GapInterval }> = [];
       for (const m of p.members) {
-        const res = deviceSlice(seriesByDevice.get(m) ?? [], s, e);
-        if (res.kind === 'anomaly') anyAnomaly = true;
-        else if (res.kind === 'unknown') anyUnknown = true;
-        else slice += res.consumption;
+        const res = deviceSlice(seriesByDevice.get(m) ?? [], s, e, maxGapSeconds);
+        if (res.kind === 'anomaly') {
+          anyAnomaly = true;
+        } else if (res.kind === 'gap') {
+          if (res.gap) sliceGaps.push({ device: m, gap: res.gap });
+        } else if (res.kind === 'unknown') {
+          anyUnknown = true;
+        } else {
+          slice += res.consumption;
+        }
       }
       if (anyAnomaly) {
+        // 下降优先:即使另一成员同一时段间隔超长,也记异常而非过长未知,
+        // 该过长间隔不计入"过长未知"的覆盖与来源展示。
         anomaly += e - s;
-      } else if (anyUnknown) {
+      } else if (sliceGaps.length > 0 || anyUnknown) {
+        // 过长间隔的未知秒数只按分组实际时间计并集:多个成员同时超长
+        // 也只计一次,不叠加成员秒数。
         unknown += e - s;
+        if (sliceGaps.length > 0) {
+          gapUnknown += e - s;
+          for (const { device, gap } of sliceGaps) {
+            gapByKey.set(`${device}|${gap.prevTs}|${gap.nextTs}`, { device, ...gap });
+          }
+        }
       } else {
         valid += e - s;
         consumption += slice;
       }
     }
   }
-  return { valid, anomaly, unknown, consumption, periods };
+  const gapIntervals = [...gapByKey.values()].sort((x, y) => {
+    if (x.device < y.device) return -1;
+    if (x.device > y.device) return 1;
+    if (x.prevTs !== y.prevTs) return x.prevTs - y.prevTs;
+    return x.nextTs - y.nextTs;
+  });
+  return { valid, anomaly, unknown, gapUnknown, consumption, periods, gapIntervals };
 }
 
 /**
@@ -394,7 +442,13 @@ export function cmdGroupHistory(opts: { id: string }): number {
  * 分组能耗日报:按当地自然日切分(默认 UTC,--tz 指定 IANA 时区),按当时
  * 生效成员计算。只读,不写入数据。返回进程退出码。
  */
-export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?: string }): number {
+export function cmdGroupDaily(opts: {
+  id: string;
+  from: number;
+  to: number;
+  tz?: string;
+  maxGapSeconds?: number;
+}): number {
   const tzName = opts.tz ?? 'UTC';
   const tz = loadTimezone(tzName);
   if (!tz) {
@@ -433,6 +487,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
 
   console.log(`group: ${group.id}`);
   console.log(`timezone: ${tzName}`);
+  console.log(`max sample gap: ${formatLimit(opts.maxGapSeconds)}`);
   let total = 0n;
   let computedDays = 0;
   let incomplete = false;
@@ -440,15 +495,19 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
     let valid = 0;
     let anomaly = 0;
     let unknown = 0;
+    let gapUnknown = 0;
     let consumption = 0n;
     const periods: GroupPeriod[] = [];
+    const gapByKey = new Map<string, GroupGap>();
     for (const p of day.periods) {
-      const stats = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end);
+      const stats = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end, opts.maxGapSeconds);
       valid += stats.valid;
       anomaly += stats.anomaly;
       unknown += stats.unknown;
+      gapUnknown += stats.gapUnknown;
       consumption += stats.consumption;
       periods.push(...stats.periods);
+      for (const g of stats.gapIntervals) gapByKey.set(`${g.device}|${g.prevTs}|${g.nextTs}`, g);
     }
     const dayIncomplete = anomaly > 0 || unknown > 0;
     if (dayIncomplete) incomplete = true;
@@ -464,10 +523,19 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
     let line =
       `  ${day.label}  ${consumptionText}` +
       `  valid=${valid}s  anomaly=${anomaly}s  unknown=${unknown}s`;
+    if (gapUnknown > 0) line += `  gap-unknown=${gapUnknown}s`;
     if (dayIncomplete) line += '  INCOMPLETE';
     console.log(line);
     for (const p of day.periods) {
       console.log(`    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+    }
+    for (const g of [...gapByKey.values()].sort((x, y) => {
+      if (x.device < y.device) return -1;
+      if (x.device > y.device) return 1;
+      if (x.prevTs !== y.prevTs) return x.prevTs - y.prevTs;
+      return x.nextTs - y.nextTs;
+    })) {
+      console.log(`    overlong gap: device=${g.device}  adjacent readings=${formatGapInterval(g)}`);
     }
     for (const p of periods) {
       const members = p.members === null ? '(no version in effect)' : p.members.join(',');

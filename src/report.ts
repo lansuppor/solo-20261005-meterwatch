@@ -21,6 +21,7 @@ import { loadStore, StoreError, dataFilePath, type Reading } from './store.ts';
 import { formatIsoUtc } from './time.ts';
 import { localDays, loadTimezone, type LocalDay } from './tz.ts';
 import { formatKwh } from './value.ts';
+import { formatLimit, formatGapInterval, type GapInterval } from './interval.ts';
 
 export interface DailyFilter {
   devices: string[];
@@ -30,6 +31,8 @@ export interface DailyFilter {
   to: number;
   /** 分日时区(IANA 名称);省略时按 UTC。 */
   tz?: string;
+  /** 最大采样间隔(正整数秒);省略表示无上限,沿用原计算口径。 */
+  maxGapSeconds?: number;
 }
 
 export const DAY_SECONDS = 86400;
@@ -39,32 +42,58 @@ function err(message: string): void {
 }
 
 export interface DayStats {
-  /** 有效(非下降区间)覆盖秒数。 */
+  /** 有效(非下降且未超长的区间)覆盖秒数。 */
   valid: number;
-  /** 异常(下降区间)覆盖秒数。 */
+  /** 异常(下降区间;即使也超长)覆盖秒数。 */
   anomaly: number;
   /** 未知(无区间覆盖)秒数。 */
   unknown: number;
+  /** 其中因相邻读数实际时间差超过限制而记为未知的秒数(unknown 的子集)。 */
+  gapUnknown: number;
   /** 该天分摊消耗,毫千瓦时;仅 valid > 0 时有意义。 */
   consumption: bigint;
+  /** 与该统计时段相交的过长非下降区间(完整时序口径,去重),用于结果展示。 */
+  gapIntervals: GapInterval[];
 }
 
-/** 计算 [segStart, segEnd) 一天的统计;区间取自完整时序。 */
-export function computeDay(series: Reading[], segStart: number, segEnd: number): DayStats {
+/** 计算 [segStart, segEnd) 一天(或一个 UTC 时段)的统计;区间取自完整时序。 */
+export function computeDay(
+  series: Reading[],
+  segStart: number,
+  segEnd: number,
+  maxGapSeconds?: number,
+): DayStats {
   let valid = 0;
   let anomaly = 0;
+  let gapUnknown = 0;
   let consumption = 0n;
+  const gapKeys = new Set<string>();
+  const gapIntervals: GapInterval[] = [];
+  const recordGap = (a: Reading, b: Reading, length: number): void => {
+    gapUnknown += length;
+    const key = `${a.ts}|${b.ts}`;
+    if (!gapKeys.has(key)) {
+      gapKeys.add(key);
+      gapIntervals.push({ prevTs: a.ts, nextTs: b.ts, duration: b.ts - a.ts });
+    }
+  };
   for (let i = 1; i < series.length; i++) {
     const a = series[i - 1];
     const b = series[i];
     const lo = Math.max(a.ts, segStart);
     const hi = Math.min(b.ts, segEnd);
     if (lo >= hi) continue;
+    const length = hi - lo;
     const diff = b.milli - a.milli;
     if (diff < 0n) {
-      anomaly += hi - lo;
+      // 下降区间即使也超过限制仍为异常:异常优先于过长未知。
+      anomaly += length;
+    } else if (maxGapSeconds !== undefined && b.ts - a.ts > maxGapSeconds) {
+      // 时间差按完整时序的相邻读数判定,查询/日界裁切不改变判定结果:
+      // 整个区间视为未知,不分摊消耗。
+      recordGap(a, b, length);
     } else {
-      valid += hi - lo;
+      valid += length;
       const duration = BigInt(b.ts - a.ts);
       const total = diff;
       // 从区间起点累计到 t 的比例量(向下取整);BigInt 除法向零截断,
@@ -74,23 +103,32 @@ export function computeDay(series: Reading[], segStart: number, segEnd: number):
     }
   }
   const unknown = segEnd - segStart - valid - anomaly;
-  return { valid, anomaly, unknown, consumption };
+  return { valid, anomaly, unknown, gapUnknown, consumption, gapIntervals };
 }
 
-/** 汇总一天内各 UTC 时段的统计;三类秒数之和等于这些时段的总秒数。 */
-function sumDayStats(series: Reading[], day: LocalDay): DayStats {
+/** 合并多个 UTC 时段的统计;gapIntervals 按区间起点去重后按时刻升序。 */
+function mergeDayStats(parts: DayStats[]): DayStats {
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
+  let gapUnknown = 0;
   let consumption = 0n;
-  for (const p of day.periods) {
-    const s = computeDay(series, p.start, p.end);
+  const byKey = new Map<string, GapInterval>();
+  for (const s of parts) {
     valid += s.valid;
     anomaly += s.anomaly;
     unknown += s.unknown;
+    gapUnknown += s.gapUnknown;
     consumption += s.consumption;
+    for (const g of s.gapIntervals) byKey.set(`${g.prevTs}|${g.nextTs}`, g);
   }
-  return { valid, anomaly, unknown, consumption };
+  const gapIntervals = [...byKey.values()].sort((x, y) => x.prevTs - y.prevTs || x.nextTs - y.nextTs);
+  return { valid, anomaly, unknown, gapUnknown, consumption, gapIntervals };
+}
+
+/** 汇总一天内各 UTC 时段的统计;三类秒数之和等于这些时段的总秒数。 */
+function sumDayStats(series: Reading[], day: LocalDay, maxGapSeconds?: number): DayStats {
+  return mergeDayStats(day.periods.map((p) => computeDay(series, p.start, p.end, maxGapSeconds)));
 }
 
 /**
@@ -142,6 +180,7 @@ export function cmdDaily(filter: DailyFilter): number {
   wanted.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
   console.log(`timezone: ${tzName}`);
+  console.log(`max sample gap: ${formatLimit(filter.maxGapSeconds)}`);
   let printed = false;
   for (const device of wanted) {
     const series = byDevice.get(device);
@@ -153,7 +192,7 @@ export function cmdDaily(filter: DailyFilter): number {
     let computedDays = 0;
     let incomplete = false;
     for (const day of days) {
-      const stats = sumDayStats(series, day);
+      const stats = sumDayStats(series, day, filter.maxGapSeconds);
       const dayIncomplete = stats.anomaly > 0 || stats.unknown > 0;
       if (dayIncomplete) incomplete = true;
 
@@ -168,10 +207,14 @@ export function cmdDaily(filter: DailyFilter): number {
       let line =
         `  ${day.label}  ${consumption}` +
         `  valid=${stats.valid}s  anomaly=${stats.anomaly}s  unknown=${stats.unknown}s`;
+      if (stats.gapUnknown > 0) line += `  gap-unknown=${stats.gapUnknown}s`;
       if (dayIncomplete) line += '  INCOMPLETE';
       console.log(line);
       for (const p of day.periods) {
         console.log(`    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+      }
+      for (const g of stats.gapIntervals) {
+        console.log(`    overlong gap: device=${device}  adjacent readings=${formatGapInterval(g)}`);
       }
     }
 

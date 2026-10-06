@@ -44,10 +44,11 @@ import {
   type Reading,
 } from './store.ts';
 import { computeDay, DAY_SECONDS, type DayStats } from './report.ts';
-import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group } from './groups.ts';
+import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group, type GroupGap } from './groups.ts';
 import { formatIsoUtc, parseUtcDate } from './time.ts';
 import { canonicalTimezone, loadTimezone, localDateRange, type LocalDay } from './tz.ts';
 import { formatKwh } from './value.ts';
+import { formatLimit, formatGapInterval } from './interval.ts';
 
 export type RuleTargetType = 'device' | 'group';
 
@@ -62,6 +63,11 @@ export interface AlertRule {
   thresholdMilli: bigint;
   /** 评估时区,运行环境解析后的规范 IANA 名(省略为 UTC),创建后固定。 */
   tz: string;
+  /**
+   * 最大采样间隔(正整数秒),创建后固定;省略(undefined)表示无上限,
+   * 旧规则与旧快照未设置时按无上限使用。
+   */
+  maxGapSeconds?: number;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -168,9 +174,30 @@ export function parseAlertState(data: unknown, source: string): AlertState {
       if (canonical === null) throw bad(`invalid timezone in rule '${r.id}'`);
       tz = canonical;
     }
+    // 最大采样间隔:旧规则/旧快照无此字段按无上限使用;字段存在但不是
+    // 正整数(含 0、负数、非整数、字符串、超出安全整数的数值)按损坏数据
+    // 拒绝,不能悄悄忽略或回退为无上限。
+    let maxGapSeconds: number | undefined;
+    if (r.maxGapSeconds !== undefined) {
+      if (
+        typeof r.maxGapSeconds !== 'number' ||
+        !Number.isSafeInteger(r.maxGapSeconds) ||
+        (r.maxGapSeconds as number) < 1
+      ) {
+        throw bad(`invalid max gap seconds in rule '${r.id}'`);
+      }
+      maxGapSeconds = r.maxGapSeconds as number;
+    }
     if (ruleIds.has(r.id)) throw bad(`duplicate rule id '${r.id}'`);
     ruleIds.add(r.id);
-    rules.push({ id: r.id, targetType, targetId, thresholdMilli: thresholdMilli as bigint, tz });
+    rules.push({
+      id: r.id,
+      targetType,
+      targetId,
+      thresholdMilli: thresholdMilli as bigint,
+      tz,
+      maxGapSeconds,
+    });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -244,6 +271,8 @@ export function serializeAlertState(state: AlertState): Record<string, unknown> 
       targetId: r.targetId,
       thresholdMilli: r.thresholdMilli.toString(),
       tz: r.tz,
+      // 无上限的规则不写该字段;读入时字段缺失即按无上限,与旧格式一致。
+      ...(r.maxGapSeconds !== undefined ? { maxGapSeconds: r.maxGapSeconds } : {}),
     })),
   };
 }
@@ -293,6 +322,8 @@ interface GroupEnv {
 
 interface DeviceEnv {
   kind: 'device';
+  /** 绑定的设备标识(用于过长间隔来源展示)。 */
+  device: string;
   series: Reading[];
 }
 
@@ -301,7 +332,7 @@ type RuleEnv = DeviceEnv | GroupEnv;
 /** 为规则准备评估环境;未知分组或存储损坏抛 StoreError。 */
 function prepareEnv(rule: AlertRule): RuleEnv {
   if (rule.targetType === 'device') {
-    return { kind: 'device', series: deviceSeries(rule.targetId) };
+    return { kind: 'device', device: rule.targetId, series: deviceSeries(rule.targetId) };
   }
   const groups = loadGroups(groupFilePath());
   const group = groups.find((g) => g.id === rule.targetId);
@@ -314,14 +345,30 @@ function prepareEnv(rule: AlertRule): RuleEnv {
   return { kind: 'group', group, byDevice };
 }
 
-/** 一天的有效/异常/未知覆盖秒数后缀。 */
-function coverageSuffix(stats: Pick<DayStats, 'valid' | 'anomaly' | 'unknown'>): string {
-  return `valid=${stats.valid}s anomaly=${stats.anomaly}s unknown=${stats.unknown}s`;
+/** 一天的有效/异常/未知覆盖秒数后缀(含过长间隔造成的未知覆盖)。 */
+function coverageSuffix(stats: Pick<DayStats, 'valid' | 'anomaly' | 'unknown' | 'gapUnknown'>): string {
+  let text = `valid=${stats.valid}s anomaly=${stats.anomaly}s unknown=${stats.unknown}s`;
+  if (stats.gapUnknown > 0) text += ` gap-unknown=${stats.gapUnknown}s`;
+  return text;
 }
 
 /** 一天各实际 UTC 时段的展示行(时段按实际时刻升序)。 */
 function periodLines(day: LocalDay): string[] {
   return day.periods.map((p) => `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+}
+
+/** 过长间隔来源行:指出相关设备及原始相邻读数时刻(按设备、时刻升序、去重)。 */
+function gapLines(gaps: GroupGap[]): string[] {
+  const byKey = new Map<string, GroupGap>();
+  for (const g of gaps) byKey.set(`${g.device}|${g.prevTs}|${g.nextTs}`, g);
+  return [...byKey.values()]
+    .sort((x, y) => {
+      if (x.device < y.device) return -1;
+      if (x.device > y.device) return 1;
+      if (x.prevTs !== y.prevTs) return x.prevTs - y.prevTs;
+      return x.nextTs - y.nextTs;
+    })
+    .map((g) => `    overlong gap: device=${g.device}  adjacent readings=${formatGapInterval(g)}`);
 }
 
 /** 规则时区的墙钟格式化器;存储载入时已校验,此处不会失败。 */
@@ -336,29 +383,50 @@ function ruleFormat(rule: AlertRule): Intl.DateTimeFormat {
 /**
  * 计算规则在一个当地日期上的统计:汇总归属该日期的全部实际 UTC 时段。
  * 设备规则用 daily 口径,分组规则用 group daily 的联合覆盖口径;
- * 日界线与成员切换都不重置各设备原读数区间的分摊起点。
+ * 日界线与成员切换都不重置各设备原读数区间的分摊起点。限制为规则创建时
+ * 固定的最大采样间隔(无上限为 undefined)。gaps 为过长间隔来源(设备
+ * 规则的来源设备即绑定设备),跨 UTC 时段按设备与区间去重。
  */
-function computeRuleDay(env: RuleEnv, day: LocalDay): DayStats {
+function computeRuleDay(
+  env: RuleEnv,
+  day: LocalDay,
+  maxGapSeconds?: number,
+): { valid: number; anomaly: number; unknown: number; gapUnknown: number; consumption: bigint; gaps: GroupGap[] } {
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
+  let gapUnknown = 0;
   let consumption = 0n;
+  const gapByKey = new Map<string, GroupGap>();
+  const absorb = (list: GroupGap[]): void => {
+    for (const g of list) gapByKey.set(`${g.device}|${g.prevTs}|${g.nextTs}`, g);
+  };
   for (const p of day.periods) {
     if (env.kind === 'device') {
-      const s = computeDay(env.series, p.start, p.end);
+      const s = computeDay(env.series, p.start, p.end, maxGapSeconds);
       valid += s.valid;
       anomaly += s.anomaly;
       unknown += s.unknown;
+      gapUnknown += s.gapUnknown;
       consumption += s.consumption;
+      absorb(s.gapIntervals.map((g) => ({ device: env.device, ...g })));
     } else {
-      const s = computeGroupSegment(env.group.versions, env.byDevice, p.start, p.end);
+      const s = computeGroupSegment(env.group.versions, env.byDevice, p.start, p.end, maxGapSeconds);
       valid += s.valid;
       anomaly += s.anomaly;
       unknown += s.unknown;
+      gapUnknown += s.gapUnknown;
       consumption += s.consumption;
+      absorb(s.gapIntervals);
     }
   }
-  return { valid, anomaly, unknown, consumption };
+  const gaps = [...gapByKey.values()].sort((x, y) => {
+    if (x.device < y.device) return -1;
+    if (x.device > y.device) return 1;
+    if (x.prevTs !== y.prevTs) return x.prevTs - y.prevTs;
+    return x.nextTs - y.nextTs;
+  });
+  return { valid, anomaly, unknown, gapUnknown, consumption, gaps };
 }
 
 /**
@@ -373,6 +441,8 @@ export function cmdRuleCreate(opts: {
   thresholdMilli: bigint;
   /** 规范 IANA 时区名(调用方已解析;省略时传 'UTC')。 */
   tz: string;
+  /** 最大采样间隔(正整数秒);省略表示无上限。创建后固定。 */
+  maxGapSeconds?: number;
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -393,19 +463,22 @@ export function cmdRuleCreate(opts: {
       existing.targetType === opts.targetType &&
       existing.targetId === opts.targetId &&
       existing.thresholdMilli === opts.thresholdMilli &&
-      existing.tz === opts.tz
+      existing.tz === opts.tz &&
+      (existing.maxGapSeconds ?? undefined) === (opts.maxGapSeconds ?? undefined)
     ) {
       console.log(
         `rule '${opts.id}' already exists with identical parameters (${targetLabel(existing)} ` +
-          `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz}); unchanged`,
+          `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz} ` +
+          `max-gap=${formatLimit(existing.maxGapSeconds)}); unchanged`,
       );
       return 0;
     }
     err(
       `rule '${opts.id}' already exists with different parameters ` +
         `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh ` +
-        `tz=${existing.tz}, got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
-        `tz=${opts.tz}); conflict`,
+        `tz=${existing.tz} max-gap=${formatLimit(existing.maxGapSeconds)}, got ${got} ` +
+        `threshold=${formatKwh(opts.thresholdMilli)} kWh tz=${opts.tz} ` +
+        `max-gap=${formatLimit(opts.maxGapSeconds)}); conflict`,
     );
     return 1;
   }
@@ -439,6 +512,7 @@ export function cmdRuleCreate(opts: {
     targetId: opts.targetId,
     thresholdMilli: opts.thresholdMilli,
     tz: opts.tz,
+    maxGapSeconds: opts.maxGapSeconds,
   });
   try {
     saveAlertState(statePath, state);
@@ -450,7 +524,8 @@ export function cmdRuleCreate(opts: {
     throw e;
   }
   console.log(
-    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh tz=${opts.tz}`,
+    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
+      `tz=${opts.tz} max-gap=${formatLimit(opts.maxGapSeconds)}`,
   );
   return 0;
 }
@@ -476,7 +551,7 @@ export function cmdRuleList(): number {
     const open = state.alerts.filter((a) => a.ruleId === r.id && a.status === 'triggered').length;
     console.log(
       `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  ` +
-        `tz=${r.tz}  open alerts=${open}`,
+        `tz=${r.tz}  max-gap=${formatLimit(r.maxGapSeconds)}  open alerts=${open}`,
     );
   }
   return 0;
@@ -525,12 +600,13 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
       lines.push(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})  no alert action`);
       continue;
     }
-    const stats = computeRuleDay(env, day);
+    const stats = computeRuleDay(env, day, rule.maxGapSeconds);
     const coverage = coverageSuffix(stats);
     if (stats.unknown > 0 || stats.anomaly > 0) {
-      // 有未知或下降覆盖:不可判定,不触发也不恢复。
+      // 有未知(含过长间隔)或下降覆盖:不可判定,不触发也不恢复。
       lines.push(`  ${label}  undecidable (${coverage})  no alert action`);
       lines.push(...periodLines(day));
+      lines.push(...gapLines(stats.gaps));
       continue;
     }
     const exceeded = stats.consumption > threshold;
@@ -577,6 +653,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
       }
     }
     lines.push(...periodLines(day));
+    lines.push(...gapLines(stats.gaps));
   }
 
   try {
@@ -590,7 +667,8 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
+      `tz=${rule.tz}  max-gap=${formatLimit(rule.maxGapSeconds)}`,
   );
   for (const line of lines) console.log(line);
   return 0;
@@ -637,7 +715,8 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
+      `tz=${rule.tz}  max-gap=${formatLimit(rule.maxGapSeconds)}`,
   );
   if (labels.length === 0) {
     console.log(`  no alerts recorded for rule '${rule.id}'`);
@@ -657,7 +736,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
     if (day === null) {
       console.log(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})`);
     } else {
-      const stats = computeRuleDay(env, day);
+      const stats = computeRuleDay(env, day, rule.maxGapSeconds);
       if (stats.unknown > 0 || stats.anomaly > 0) {
         console.log(`  ${label}  undecidable (${coverageSuffix(stats)})`);
       } else {
@@ -668,6 +747,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
         );
       }
       for (const line of periodLines(day)) console.log(line);
+      for (const line of gapLines(stats.gaps)) console.log(line);
     }
     const alerts = state.alerts
       .filter((a) => a.ruleId === rule.id && a.date === label)

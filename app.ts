@@ -7,6 +7,7 @@ import { cmdBackup, cmdRestore, withDirectoryCoordination } from './src/backup.t
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
+import { parseMaxGapSeconds } from './src/interval.ts';
 import type { CorrectionItem } from './src/store.ts';
 
 const name = 'meterwatch';
@@ -20,9 +21,9 @@ Usage:
   node app.ts --help | -h           显示本帮助
   node app.ts import <file.csv>     导入 CSV 读数(整批成功或整批拒绝)
   node app.ts readings [筛选...]    查询读数、区间与消耗
-  node app.ts daily --from <iso> --to <iso> [--device <id>...] [--tz <时区>]
+  node app.ts daily --from <iso> --to <iso> [--device <id>...] [--tz <时区>] [--max-gap-seconds <秒>]
                                     按当地自然日核查能耗的只读日报(默认 UTC 分日)
-  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh> [--tz <时区>]
+  node app.ts rule create --id <id> (--device <设备> | --group <分组>) --threshold <kWh> [--tz <时区>] [--max-gap-seconds <秒>]
                                     创建每日能耗阈值告警规则(设备或分组,时区省略为 UTC)
   node app.ts rule list             查看全部告警规则
   node app.ts evaluate --rule <id> --from <日期> --to <日期>
@@ -34,7 +35,7 @@ Usage:
                                     配置分组成员版本(首次配置即建立分组)
   node app.ts group history --id <id>
                                     查看分组成员版本历史(只读)
-  node app.ts group daily --id <id> --from <iso> --to <iso> [--tz <时区>]
+  node app.ts group daily --id <id> --from <iso> --to <iso> [--tz <时区>] [--max-gap-seconds <秒>]
                                     按当时生效成员的分组能耗日报(只读,默认 UTC 分日)
   node app.ts correct --request <id> --item --device <设备> --at <iso> --expect <kWh> --set <kWh>
                                     [--item --device ... --at ... --expect ... --set ...]...
@@ -94,6 +95,11 @@ Usage:
   --to <iso8601>    结束时刻(不含),必填,必须晚于起点
   --device <id>     只统计指定设备(可重复使用);省略时统计库内全部设备
   --tz <时区>       分日时区(IANA 名,如 Asia/Shanghai);省略时按 UTC
+  --max-gap-seconds <秒>
+                    最大采样间隔(正整数秒,如 900);省略表示无上限。只影响
+                    本次查询结果,不写入。相邻读数实际时间差超过它的非下降
+                    区间整体记为未知(等于限制仍可信),查询范围、日界线不
+                    裁短判定;下降区间即使也超长仍记异常。
   日期按分日时区的当地零点划分,首尾日期只统计与查询范围重叠的部分。
   估算口径:由每个设备完整时序的相邻读数构成区间,区间两端读数即使在
   查询范围外也参与;非下降区间把累计值之差按持续时间均匀分摊,以千分之一
@@ -122,14 +128,33 @@ Usage:
   成员集合重试成功且不新增,异成员集合报冲突;未知设备报错,配置整次成功
   或不提交。history 按生效时刻列出全部版本(只读)。daily 的 --from(含)
   与 --to(不含)必填且起点必须更早,按分日时区的自然日切分(--tz 可选,
-  默认 UTC,口径见上文"分日时区"),按当时生效成员计算,首个版本生效前
-  记为未知;每个时段只有全部生效成员均处于非下降读数
+  默认 UTC,口径见上文"分日时区"),--max-gap-seconds 可选(正整数秒,
+  省略无上限,口径见下文"最大采样间隔"),按当时生效成员计算,首个版本
+  生效前记为未知;每个时段只有全部生效成员均处于非下降、未超长读数
   区间才是有效覆盖并计入成员消耗之和,任一成员下降为异常,否则任一成员
-  未知为未知;异常与未知时段不计任何成员消耗,覆盖秒数按分组实际时间计;
-  各设备片段仍以原读数区间起点累计比例向下取整,日界线、查询边界与成员
-  切换均不重置分摊起点,拆开查询相加一致。每天显示生效成员及其时段、估算
-  消耗与有效/异常/未知秒数(三者之和等于当天查询时长);有异常或未知标为
-  不完整,无有效覆盖显示无法计算。配置不改读数、规则和告警,导入不改配置。
+  未知(含其过长间隔)为未知;过长间隔的未知秒数按分组实际时间计并集,
+  不叠加成员秒数;异常与未知时段不计任何成员消耗,覆盖秒数按分组实际
+  时间计;各设备片段仍以原读数区间起点累计比例向下取整,日界线、查询
+  边界与成员切换均不重置分摊起点、也不裁短相邻间隔,拆开查询相加一致。
+  每天显示生效限制、生效成员及其时段、估算消耗与有效/异常/未知秒数
+  (含 gap-unknown 过长未知秒数,三者之和等于当天查询时长)并指出过长
+  间隔的设备与原始相邻读数时刻;有异常或未知标为不完整,无有效覆盖
+  显示无法计算。配置不改读数、规则和告警,导入不改配置。
+
+最大采样间隔(--max-gap-seconds,daily、group daily 可选;rule create 固定):
+  以正整数秒给出相邻读数实际时间差的上限,等于限制仍可信,超过才记未知;
+  省略表示无上限,沿用原计算口径。时间差按完整已存时序的相邻读数判定,
+  两端读数即使在查询范围外也参与,查询范围、当地日界线、分组成员切换都
+  不把区间裁短而变成可信。非下降区间超长时整个区间视为未知,不分摊消耗;
+  下降区间仍为异常,即使它也超长(异常优先);首末读数外与孤立读数时段
+  仍未知,不外推。分组按当时生效成员分别判断:任一成员下降优先记异常,
+  否则任一成员未知(含过长)便记未知,全部可信才计成员消耗之和;首个
+  成员版本前仍未知。日报与告警显示当前采用的限制、有效/异常/未知秒数
+  (未知中单独标出 gap-unknown 过长秒数)并指出相关设备与原始相邻读数
+  时刻。daily/group daily 的设置只影响本次结果;rule create 的限制创建后
+  固定,同标识重试须连同限制一起比较(同参数不新增,异参数冲突),
+  rule list 显示;旧规则、旧快照未设置时按无上限,已存非法限制按损坏
+  数据拒绝。仅全天有效才比较每日阈值,未知或异常日期不触发也不恢复。
 
 修正与撤销(correct / undo / corrections):
   correct 一次提交指定非空请求标识(--request,去首尾空白、区分大小写,在
@@ -170,9 +195,11 @@ Usage:
   阈值非负、最多三位小数 kWh;目标、阈值与时区创建后固定,分组规则绑定分组
   标识、不冻结创建时成员。--tz 可选,接受运行环境支持的 IANA 时区名(如
   Asia/Shanghai、America/New_York),省略为 UTC(与显式 UTC 等价);时区按
-  运行环境解析后的规范名存储与比较,未知时区名为参数错误,返回 2。相同标识、
-  同目标类型、同目标标识、等价阈值及同时区重试成功且不重复创建,任一不同
-  即报冲突。
+  运行环境解析后的规范名存储与比较,未知时区名为参数错误,返回 2。
+  --max-gap-seconds 可选,正整数秒,给出规则固定的最大采样间隔;省略为
+  无上限,创建后固定,口径见上文"最大采样间隔"。相同标识、同目标类型、
+  同目标标识、等价阈值、同时区及同间隔限制重试成功且不重复创建,任一
+  不同即报冲突。rule list 显示限制(无上限为 none)。
   evaluate 与 alerts 的 --from/--to 为 YYYY-MM-DD 的当地日期(按规则时区
   解释),起日含、止日不含,起日必须更早。每个日期统计归属该日期的全部实际
   UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨重复小时完整
@@ -180,9 +207,11 @@ Usage:
   的日期标明跳过,不判定、不创建也不恢复告警。设备规则评估口径与 daily 相同;
   分组规则与 group daily 的联合覆盖口径相同:每天按当时生效的成员版本计算,
   允许日内切换,首个版本生效前为未知,任一成员下降为异常,否则任一成员未知
-  为未知;成员切换不重置各设备原读数区间的分摊起点。仅全天有效覆盖的日期
-  可判定,消耗严格大于阈值才超限(等于为正常),零增长有效;有未知或下降
-  覆盖的日期不可判定,不触发也不恢复。每个规则每个日期独立跟踪:首次超限
+  为未知;成员切换不重置各设备原读数区间的分摊起点。规则固定的最大采样
+  间隔同样生效(见上文"最大采样间隔"),过长非下降区间计入未知并以
+  gap-unknown 单独标出。仅全天有效覆盖的日期
+  可判定,消耗严格大于阈值才超限(等于为正常),零增长有效;有未知(含
+  过长间隔)或下降覆盖的日期不可判定,不触发也不恢复。每个规则每个日期独立跟踪:首次超限
   创建带全局唯一标识的未确认告警,重复超限保留原标识;完整评估正常才记录
   恢复;恢复后再超限创建新的未确认告警,旧记录保留,原确认不转移。批量日期
   评估要么全部提交要么不提交。
@@ -230,14 +259,19 @@ interface ParsedOptions {
   from?: number;
   to?: number;
   tz?: string;
+  maxGapSeconds?: number;
 }
 
-/** 解析 --device/--from/--to(及允许时的 --tz)选项;出错返回错误消息字符串。 */
-function parseOptions(rest: string[], allowTz = false): ParsedOptions | string {
+/**
+ * 解析 --device/--from/--to(及允许时的 --tz、--max-gap-seconds)选项;
+ * 出错返回错误消息字符串。
+ */
+function parseOptions(rest: string[], allowTz = false, allowMaxGap = false): ParsedOptions | string {
   const devices: string[] = [];
   let from: number | undefined;
   let to: number | undefined;
   let tz: string | undefined;
+  let maxGapSeconds: number | undefined;
   for (let i = 0; i < rest.length; i++) {
     let opt = rest[i];
     let value: string | undefined;
@@ -265,11 +299,18 @@ function parseOptions(rest: string[], allowTz = false): ParsedOptions | string {
     } else if (opt === '--tz' && allowTz) {
       tz = value.trim();
       if (tz === '') return "'--tz' 的值不能为空";
+    } else if (opt === '--max-gap-seconds' && allowMaxGap) {
+      const n = parseMaxGapSeconds(value.trim());
+      if (n === null) {
+        return `选项 '--max-gap-seconds' 的值无效: '${value}'(需正整数秒,如 900)`;
+      }
+      if (maxGapSeconds !== undefined) return "选项 '--max-gap-seconds' 只能出现一次";
+      maxGapSeconds = n;
     } else {
       return `无法识别的选项 '${opt}'`;
     }
   }
-  return { devices, from, to, tz };
+  return { devices, from, to, tz, maxGapSeconds };
 }
 
 /** 校验 IANA 分日时区名;无效时返回错误消息字符串。 */
@@ -328,18 +369,22 @@ function cmdRule(rest: string[]): number {
     return cmdRuleList();
   }
   if (sub === 'create') {
-    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold', '--tz']);
+    const flags = parseFlags(subrest, ['--id', '--device', '--group', '--threshold', '--tz', '--max-gap-seconds']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
     const deviceList = flags.get('--device');
     const groupList = flags.get('--group');
     const thresholdRaw = oneFlag(flags, '--threshold');
     const tzList = flags.get('--tz');
+    const gapList = flags.get('--max-gap-seconds');
     if (idRaw === null || thresholdRaw === null) {
       return usageError("'rule create' 需要 --id 与 --threshold 各恰好一个");
     }
     if (tzList !== undefined && tzList.length !== 1) {
       return usageError("'rule create' 的 --tz 只能出现一次");
+    }
+    if (gapList !== undefined && gapList.length !== 1) {
+      return usageError("'rule create' 的 --max-gap-seconds 只能出现一次");
     }
     const hasDevice = deviceList !== undefined;
     const hasGroup = groupList !== undefined;
@@ -356,6 +401,17 @@ function cmdRule(rest: string[]): number {
     if (thresholdMilli === null) {
       return usageError(`阈值无效: '${thresholdRaw.trim()}'(需非负、最多三位小数的 kWh)`);
     }
+    // 可选最大采样间隔:正整数秒;省略表示无上限。创建后固定。
+    let maxGapSeconds: number | undefined;
+    if (gapList !== undefined) {
+      const gap = parseMaxGapSeconds(gapList[0].trim());
+      if (gap === null) {
+        return usageError(
+          `最大采样间隔无效: '${gapList[0].trim()}'(--max-gap-seconds 需正整数秒,如 900)`,
+        );
+      }
+      maxGapSeconds = gap;
+    }
     // 时区省略与显式 UTC 等价;按运行环境解析后的规范名存储与比较。
     let tz = 'UTC';
     if (tzList !== undefined) {
@@ -370,11 +426,11 @@ function cmdRule(rest: string[]): number {
     if (hasDevice) {
       const device = (deviceList as string[])[0].trim();
       if (device === '') return usageError("'--device' 的值不能为空");
-      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli, tz });
+      return cmdRuleCreate({ id, targetType: 'device', targetId: device, thresholdMilli, tz, maxGapSeconds });
     }
     const group = (groupList as string[])[0].trim();
     if (group === '') return usageError("'--group' 的值不能为空");
-    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli, tz });
+    return cmdRuleCreate({ id, targetType: 'group', targetId: group, thresholdMilli, tz, maxGapSeconds });
   }
   if (sub === undefined) return usageError("'rule' 需要子命令 create 或 list");
   return usageError(`无法识别的 rule 子命令 '${sub}'`);
@@ -470,7 +526,7 @@ function cmdGroup(rest: string[]): number {
     return cmdGroupHistory({ id });
   }
   if (sub === 'daily') {
-    const flags = parseFlags(subrest, ['--id', '--from', '--to', '--tz']);
+    const flags = parseFlags(subrest, ['--id', '--from', '--to', '--tz', '--max-gap-seconds']);
     if (typeof flags === 'string') return usageError(flags);
     const idRaw = oneFlag(flags, '--id');
     const fromRaw = oneFlag(flags, '--from');
@@ -481,6 +537,10 @@ function cmdGroup(rest: string[]): number {
     const tzList = flags.get('--tz');
     if (tzList !== undefined && tzList.length !== 1) {
       return usageError("'group daily' 的 --tz 只能出现一次");
+    }
+    const gapList = flags.get('--max-gap-seconds');
+    if (gapList !== undefined && gapList.length !== 1) {
+      return usageError("'group daily' 的 --max-gap-seconds 只能出现一次");
     }
     const id = idRaw.trim();
     if (id === '') return usageError('分组标识不能为空');
@@ -500,7 +560,17 @@ function cmdGroup(rest: string[]): number {
       const bad = checkTz(tz);
       if (bad !== null) return usageError(bad);
     }
-    return cmdGroupDaily({ id, from, to, tz });
+    let maxGapSeconds: number | undefined;
+    if (gapList !== undefined) {
+      const gap = parseMaxGapSeconds(gapList[0].trim());
+      if (gap === null) {
+        return usageError(
+          `选项 '--max-gap-seconds' 的值无效: '${gapList[0].trim()}'(需正整数秒,如 900)`,
+        );
+      }
+      maxGapSeconds = gap;
+    }
+    return cmdGroupDaily({ id, from, to, tz, maxGapSeconds });
   }
   if (sub === undefined) return usageError("'group' 需要子命令 configure、history 或 daily");
   return usageError(`无法识别的 group 子命令 '${sub}'`);
@@ -610,7 +680,7 @@ function runCommand(args: string[]): number {
   }
 
   if (cmd === 'daily') {
-    const parsed = parseOptions(rest, true);
+    const parsed = parseOptions(rest, true, true);
     if (typeof parsed === 'string') return usageError(parsed);
     if (parsed.from === undefined || parsed.to === undefined) {
       return usageError("'daily' 必须同时提供 --from 与 --to(起点含、终点不含)");
@@ -622,7 +692,13 @@ function runCommand(args: string[]): number {
       const bad = checkTz(parsed.tz);
       if (bad !== null) return usageError(bad);
     }
-    return cmdDaily({ devices: parsed.devices, from: parsed.from, to: parsed.to, tz: parsed.tz });
+    return cmdDaily({
+      devices: parsed.devices,
+      from: parsed.from,
+      to: parsed.to,
+      tz: parsed.tz,
+      maxGapSeconds: parsed.maxGapSeconds,
+    });
   }
 
   if (cmd === 'rule') return cmdRule(rest);
