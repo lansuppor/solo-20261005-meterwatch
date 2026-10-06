@@ -18,6 +18,10 @@
 //   计算,不累加成员秒数。各设备片段仍以原读数区间起点累计比例向下取整,
 //   两端累计量之差为消耗;日界线、查询边界与成员切换均不重置分摊起点,
 //   拆开查询相加结果一致。全程 BigInt 精确计算,kWh 固定三位小数。
+// - 可选的最大采样间隔限制(正整数秒):成员的非下降相邻区间实际时间差超过
+//   限制时该成员在该区间记为未知(整个区间,不因查询范围、日界线或成员切换
+//   裁短;等于限制仍可信),下降区间即使超过限制仍为异常。分组的过长间隔
+//   未知秒数只在最终未知时段内按实际时间计并集,不叠加成员秒数。
 // - 日报与历史只读;读取读数时拒绝同设备同一实际时刻的多条存储记录。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -26,6 +30,12 @@ import { dataFilePath, groupFilePath, loadStore, StoreError, type Reading } from
 import { formatIsoUtc } from './time.ts';
 import { localDays, loadTimezone } from './tz.ts';
 import { formatKwh } from './value.ts';
+import {
+  formatGapLine,
+  maxIntervalText,
+  mergeGaps,
+  type GapDetail,
+} from './report.ts';
 
 export interface GroupVersion {
   /** 生效时刻(含),epoch 秒。 */
@@ -178,23 +188,36 @@ function floorIndex(series: Reading[], s: number): number {
 
 type SliceKind = 'valid' | 'anomaly' | 'unknown';
 
+interface DeviceSlice {
+  kind: SliceKind;
+  consumption: bigint;
+  /** kind 为 unknown 且由超过采样间隔限制的区间造成时的原始区间(相邻读数时刻)。 */
+  gap?: { start: number; end: number };
+}
+
 /**
  * 单设备在片段 [s, e) 上的状态与消耗。片段完全落在同一读数区间内
  * (调用方保证切点包含区间内全部读数时刻)。非下降区间以区间起点累计
  * 比例向下取整,消耗为两端累计量之差;下降区间为异常;首条读数之前、
- * 末条之后及孤立读数时段为未知,不外推。
+ * 末条之后及孤立读数时段为未知,不外推。maxInterval 为可选的最大采样
+ * 间隔限制(秒):非下降区间的完整实际时间差(不按片段裁短)超过限制时
+ * 整个区间为未知,等于限制仍可信;下降区间即使超过限制仍为异常。
  */
 function deviceSlice(
   series: Reading[],
   s: number,
   e: number,
-): { kind: SliceKind; consumption: bigint } {
+  maxInterval?: number,
+): DeviceSlice {
   const i = floorIndex(series, s);
   if (i < 0 || i + 1 >= series.length) return { kind: 'unknown', consumption: 0n };
   const a = series[i];
   const b = series[i + 1];
   const diff = b.milli - a.milli;
   if (diff < 0n) return { kind: 'anomaly', consumption: 0n };
+  if (maxInterval !== undefined && b.ts - a.ts > maxInterval) {
+    return { kind: 'unknown', consumption: 0n, gap: { start: a.ts, end: b.ts } };
+  }
   const duration = BigInt(b.ts - a.ts);
   const cumulative = (t: number): bigint => (diff * BigInt(t - a.ts)) / duration;
   return { kind: 'valid', consumption: cumulative(e) - cumulative(s) };
@@ -210,12 +233,17 @@ export interface GroupPeriod {
 }
 
 export interface GroupSegmentStats {
-  /** 有效(全部成员非下降)覆盖秒数,按分组实际时间计。 */
+  /** 有效(全部成员非下降且未超采样间隔限制)覆盖秒数,按分组实际时间计。 */
   valid: number;
   /** 异常(任一成员下降)覆盖秒数。 */
   anomaly: number;
   /** 未知(无生效版本或任一成员未知)覆盖秒数。 */
   unknown: number;
+  /** unknown 中由成员过长区间造成的秒数:只在最终未知时段内按实际时间
+   *  计并集,不叠加成员秒数。 */
+  gapUnknown: number;
+  /** 与统计范围相交的成员过长区间明细(设备与原始相邻读数时刻),已去重。 */
+  gaps: GapDetail[];
   /** 有效时段内全部生效成员的分摊消耗之和,毫千瓦时 BigInt。 */
   consumption: bigint;
   /** 段内按生效时刻切分的成员时段。 */
@@ -225,12 +253,15 @@ export interface GroupSegmentStats {
 /**
  * 计算分组在 [segStart, segEnd) 上的覆盖与消耗。
  * versions 按生效时刻升序;seriesByDevice 含全部版本成员的完整时序。
+ * maxInterval 为可选的最大采样间隔限制(秒),按完整已存时序的相邻读数
+ * 实际时间差判定,等于限制仍可信。
  */
 export function computeGroupSegment(
   versions: GroupVersion[],
   seriesByDevice: Map<string, Reading[]>,
   segStart: number,
   segEnd: number,
+  maxInterval?: number,
 ): GroupSegmentStats {
   // 按版本生效时刻把段切成成员恒定的时段;首个版本生效前 members 为 null。
   const periods: GroupPeriod[] = [];
@@ -251,6 +282,8 @@ export function computeGroupSegment(
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
+  let gapUnknown = 0;
+  const gaps: GapDetail[] = [];
   let consumption = 0n;
   for (const p of periods) {
     if (p.members === null) {
@@ -271,23 +304,32 @@ export function computeGroupSegment(
       let anyAnomaly = false;
       let anyUnknown = false;
       let slice = 0n;
+      const sliceGaps: GapDetail[] = [];
       for (const m of p.members) {
-        const res = deviceSlice(seriesByDevice.get(m) ?? [], s, e);
+        const res = deviceSlice(seriesByDevice.get(m) ?? [], s, e, maxInterval);
         if (res.kind === 'anomaly') anyAnomaly = true;
-        else if (res.kind === 'unknown') anyUnknown = true;
-        else slice += res.consumption;
+        else if (res.kind === 'unknown') {
+          anyUnknown = true;
+          if (res.gap) sliceGaps.push({ device: m, start: res.gap.start, end: res.gap.end });
+        } else slice += res.consumption;
       }
       if (anyAnomaly) {
         anomaly += e - s;
       } else if (anyUnknown) {
         unknown += e - s;
+        // 过长间隔未知只在最终未知时段内按实际时间计并集:同一子片段内
+        // 任一成员有过长区间即计一次,不叠加成员秒数。
+        if (sliceGaps.length > 0) {
+          gapUnknown += e - s;
+          mergeGaps(gaps, sliceGaps);
+        }
       } else {
         valid += e - s;
         consumption += slice;
       }
     }
   }
-  return { valid, anomaly, unknown, consumption, periods };
+  return { valid, anomaly, unknown, gapUnknown, gaps, consumption, periods };
 }
 
 /**
@@ -394,7 +436,14 @@ export function cmdGroupHistory(opts: { id: string }): number {
  * 分组能耗日报:按当地自然日切分(默认 UTC,--tz 指定 IANA 时区),按当时
  * 生效成员计算。只读,不写入数据。返回进程退出码。
  */
-export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?: string }): number {
+export function cmdGroupDaily(opts: {
+  id: string;
+  from: number;
+  to: number;
+  tz?: string;
+  /** 最大采样间隔限制(正整数秒);省略表示无上限。只影响本次查询结果。 */
+  maxInterval?: number;
+}): number {
   const tzName = opts.tz ?? 'UTC';
   const tz = loadTimezone(tzName);
   if (!tz) {
@@ -433,6 +482,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
 
   console.log(`group: ${group.id}`);
   console.log(`timezone: ${tzName}`);
+  console.log(`max-interval: ${maxIntervalText(opts.maxInterval)}`);
   let total = 0n;
   let computedDays = 0;
   let incomplete = false;
@@ -440,13 +490,17 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
     let valid = 0;
     let anomaly = 0;
     let unknown = 0;
+    let gapUnknown = 0;
+    const gaps: GapDetail[] = [];
     let consumption = 0n;
     const periods: GroupPeriod[] = [];
     for (const p of day.periods) {
-      const stats = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end);
+      const stats = computeGroupSegment(group.versions, seriesByDevice, p.start, p.end, opts.maxInterval);
       valid += stats.valid;
       anomaly += stats.anomaly;
       unknown += stats.unknown;
+      gapUnknown += stats.gapUnknown;
+      mergeGaps(gaps, stats.gaps);
       consumption += stats.consumption;
       periods.push(...stats.periods);
     }
@@ -464,6 +518,7 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
     let line =
       `  ${day.label}  ${consumptionText}` +
       `  valid=${valid}s  anomaly=${anomaly}s  unknown=${unknown}s`;
+    if (opts.maxInterval !== undefined) line += `  gap=${gapUnknown}s`;
     if (dayIncomplete) line += '  INCOMPLETE';
     console.log(line);
     for (const p of day.periods) {
@@ -474,6 +529,9 @@ export function cmdGroupDaily(opts: { id: string; from: number; to: number; tz?:
       console.log(
         `    members=${members}  period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`,
       );
+    }
+    for (const g of gaps) {
+      console.log(formatGapLine(g));
     }
   }
 

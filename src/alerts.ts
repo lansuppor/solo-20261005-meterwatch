@@ -8,8 +8,11 @@
 // 区分大小写)。阈值为非负、最多三位小数的 kWh,绑定目标与阈值创建后固定。
 // 每条规则带固定时区(创建时 --tz 指定 IANA 名,省略为 UTC;按运行环境解析后
 // 的规范名存储与比较,省略与显式 UTC 等价),评估与历史的日期按规则时区的当地
-// 日期解释。相同标识、同目标类型、同目标标识、等价阈值及同时区重试成功且不
-// 重复创建,任一不同即报冲突。
+// 日期解释。规则可带可选的最大采样间隔限制(创建时 --max-interval 指定正整数
+// 秒数,省略为无上限,创建后固定):非下降相邻区间的实际时间差超过限制时整个
+// 区间视为未知,等于限制仍可信;下降区间即使超过限制仍为异常。相同标识、同
+// 目标类型、同目标标识、等价阈值、同时区及同间隔限制重试成功且不重复创建,
+// 任一不同即报冲突。
 //
 // - 评估针对连续完整的当地日期(起日含、止日不含)。每个日期统计归属该日期的
 //   全部实际 UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨
@@ -29,8 +32,9 @@
 // - 规则与历史存于数据目录的 alerts.json(与 readings.json、groups.json 相互
 //   独立,导入与补录成员版本都不会自动评估)。创建、评估、确认都先在内存完成
 //   全部计算再一次性原子写入,任何失败不留下部分状态;损坏或不可读存储明确
-//   报错,绝不当作空库;存储内非法时区按损坏处理,不能回退为 UTC。旧版仅含
-//   device 字段、无时区的规则按 UTC 继续使用,无需手工转换。
+//   报错,绝不当作空库;存储内非法时区按损坏处理,不能回退为 UTC;存储内非法
+//   间隔限制同样按损坏数据拒绝,不能悄悄忽略。旧版仅含 device 字段、无时区、
+//   无间隔限制的规则按 UTC、无上限继续使用,无需手工转换。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -43,7 +47,7 @@ import {
   StoreError,
   type Reading,
 } from './store.ts';
-import { computeDay, DAY_SECONDS, type DayStats } from './report.ts';
+import { computeDay, DAY_SECONDS, formatGapLine, maxIntervalText, mergeGaps, type DayStats, type GapDetail } from './report.ts';
 import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group } from './groups.ts';
 import { formatIsoUtc, parseUtcDate } from './time.ts';
 import { canonicalTimezone, loadTimezone, localDateRange, type LocalDay } from './tz.ts';
@@ -62,6 +66,8 @@ export interface AlertRule {
   thresholdMilli: bigint;
   /** 评估时区,运行环境解析后的规范 IANA 名(省略为 UTC),创建后固定。 */
   tz: string;
+  /** 最大采样间隔限制(正整数秒);省略表示无上限。创建后固定。 */
+  maxInterval?: number;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -168,9 +174,18 @@ export function parseAlertState(data: unknown, source: string): AlertState {
       if (canonical === null) throw bad(`invalid timezone in rule '${r.id}'`);
       tz = canonical;
     }
+    // 采样间隔限制:新版字段 maxInterval 存正整数秒;旧版无该字段的规则按
+    // 无上限使用。存储内非法限制按损坏数据拒绝,不能悄悄忽略。
+    let maxInterval: number | undefined;
+    if (r.maxInterval !== undefined) {
+      if (!Number.isSafeInteger(r.maxInterval) || (r.maxInterval as number) < 1) {
+        throw bad(`invalid maxInterval in rule '${r.id}'`);
+      }
+      maxInterval = r.maxInterval as number;
+    }
     if (ruleIds.has(r.id)) throw bad(`duplicate rule id '${r.id}'`);
     ruleIds.add(r.id);
-    rules.push({ id: r.id, targetType, targetId, thresholdMilli: thresholdMilli as bigint, tz });
+    rules.push({ id: r.id, targetType, targetId, thresholdMilli: thresholdMilli as bigint, tz, maxInterval });
   }
 
   const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -244,6 +259,7 @@ export function serializeAlertState(state: AlertState): Record<string, unknown> 
       targetId: r.targetId,
       thresholdMilli: r.thresholdMilli.toString(),
       tz: r.tz,
+      ...(r.maxInterval !== undefined ? { maxInterval: r.maxInterval } : {}),
     })),
   };
 }
@@ -314,14 +330,23 @@ function prepareEnv(rule: AlertRule): RuleEnv {
   return { kind: 'group', group, byDevice };
 }
 
-/** 一天的有效/异常/未知覆盖秒数后缀。 */
-function coverageSuffix(stats: Pick<DayStats, 'valid' | 'anomaly' | 'unknown'>): string {
-  return `valid=${stats.valid}s anomaly=${stats.anomaly}s unknown=${stats.unknown}s`;
+/** 一天的有效/异常/未知覆盖秒数后缀;采用间隔限制时附上过长间隔造成的未知秒数。 */
+function coverageSuffix(
+  stats: Pick<DayStats, 'valid' | 'anomaly' | 'unknown' | 'gapUnknown'>,
+  limited: boolean,
+): string {
+  const base = `valid=${stats.valid}s anomaly=${stats.anomaly}s unknown=${stats.unknown}s`;
+  return limited ? `${base} gap=${stats.gapUnknown}s` : base;
 }
 
 /** 一天各实际 UTC 时段的展示行(时段按实际时刻升序)。 */
 function periodLines(day: LocalDay): string[] {
   return day.periods.map((p) => `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
+}
+
+/** 一天内过长区间明细的展示行(指出相关设备与原始相邻读数时刻)。 */
+function gapLines(stats: Pick<DayStats, 'gaps'>, rule: AlertRule): string[] {
+  return stats.gaps.map((g) => formatGapLine(g, rule.targetType === 'device' ? rule.targetId : undefined));
 }
 
 /** 规则时区的墙钟格式化器;存储载入时已校验,此处不会失败。 */
@@ -337,34 +362,41 @@ function ruleFormat(rule: AlertRule): Intl.DateTimeFormat {
  * 计算规则在一个当地日期上的统计:汇总归属该日期的全部实际 UTC 时段。
  * 设备规则用 daily 口径,分组规则用 group daily 的联合覆盖口径;
  * 日界线与成员切换都不重置各设备原读数区间的分摊起点。
+ * maxInterval 为规则固定的采样间隔限制(省略为无上限)。
  */
-function computeRuleDay(env: RuleEnv, day: LocalDay): DayStats {
+function computeRuleDay(env: RuleEnv, day: LocalDay, maxInterval?: number): DayStats {
   let valid = 0;
   let anomaly = 0;
   let unknown = 0;
+  let gapUnknown = 0;
+  const gaps: GapDetail[] = [];
   let consumption = 0n;
   for (const p of day.periods) {
     if (env.kind === 'device') {
-      const s = computeDay(env.series, p.start, p.end);
+      const s = computeDay(env.series, p.start, p.end, maxInterval);
       valid += s.valid;
       anomaly += s.anomaly;
       unknown += s.unknown;
+      gapUnknown += s.gapUnknown;
+      mergeGaps(gaps, s.gaps);
       consumption += s.consumption;
     } else {
-      const s = computeGroupSegment(env.group.versions, env.byDevice, p.start, p.end);
+      const s = computeGroupSegment(env.group.versions, env.byDevice, p.start, p.end, maxInterval);
       valid += s.valid;
       anomaly += s.anomaly;
       unknown += s.unknown;
+      gapUnknown += s.gapUnknown;
+      mergeGaps(gaps, s.gaps);
       consumption += s.consumption;
     }
   }
-  return { valid, anomaly, unknown, consumption };
+  return { valid, anomaly, unknown, gapUnknown, gaps, consumption };
 }
 
 /**
- * 创建规则。相同标识、同目标类型、同目标标识、等价阈值及同时区(规范名)
- * 重试成功且不重复创建;任一不同即报冲突。设备必须已有存储读数;分组必须
- * 已配置。返回进程退出码。
+ * 创建规则。相同标识、同目标类型、同目标标识、等价阈值、同时区(规范名)
+ * 及同采样间隔限制重试成功且不重复创建;任一不同即报冲突。设备必须已有
+ * 存储读数;分组必须已配置。返回进程退出码。
  */
 export function cmdRuleCreate(opts: {
   id: string;
@@ -373,6 +405,8 @@ export function cmdRuleCreate(opts: {
   thresholdMilli: bigint;
   /** 规范 IANA 时区名(调用方已解析;省略时传 'UTC')。 */
   tz: string;
+  /** 最大采样间隔限制(正整数秒);省略表示无上限,创建后固定。 */
+  maxInterval?: number;
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -393,19 +427,22 @@ export function cmdRuleCreate(opts: {
       existing.targetType === opts.targetType &&
       existing.targetId === opts.targetId &&
       existing.thresholdMilli === opts.thresholdMilli &&
-      existing.tz === opts.tz
+      existing.tz === opts.tz &&
+      existing.maxInterval === opts.maxInterval
     ) {
       console.log(
         `rule '${opts.id}' already exists with identical parameters (${targetLabel(existing)} ` +
-          `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz}); unchanged`,
+          `threshold=${formatKwh(existing.thresholdMilli)} kWh tz=${existing.tz} ` +
+          `max-interval=${maxIntervalText(existing.maxInterval)}); unchanged`,
       );
       return 0;
     }
     err(
       `rule '${opts.id}' already exists with different parameters ` +
         `(stored ${targetLabel(existing)} threshold=${formatKwh(existing.thresholdMilli)} kWh ` +
-        `tz=${existing.tz}, got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
-        `tz=${opts.tz}); conflict`,
+        `tz=${existing.tz} max-interval=${maxIntervalText(existing.maxInterval)}, ` +
+        `got ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
+        `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)}); conflict`,
     );
     return 1;
   }
@@ -439,6 +476,7 @@ export function cmdRuleCreate(opts: {
     targetId: opts.targetId,
     thresholdMilli: opts.thresholdMilli,
     tz: opts.tz,
+    maxInterval: opts.maxInterval,
   });
   try {
     saveAlertState(statePath, state);
@@ -450,12 +488,13 @@ export function cmdRuleCreate(opts: {
     throw e;
   }
   console.log(
-    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh tz=${opts.tz}`,
+    `rule '${opts.id}' created: ${got} threshold=${formatKwh(opts.thresholdMilli)} kWh ` +
+      `tz=${opts.tz} max-interval=${maxIntervalText(opts.maxInterval)}`,
   );
   return 0;
 }
 
-/** 列出全部规则(含目标类型与时区)。只读。返回进程退出码。 */
+/** 列出全部规则(含目标类型、时区与采样间隔限制)。只读。返回进程退出码。 */
 export function cmdRuleList(): number {
   let state: AlertState;
   try {
@@ -476,7 +515,7 @@ export function cmdRuleList(): number {
     const open = state.alerts.filter((a) => a.ruleId === r.id && a.status === 'triggered').length;
     console.log(
       `rule ${r.id}  ${targetLabel(r)}  threshold=${formatKwh(r.thresholdMilli)} kWh  ` +
-        `tz=${r.tz}  open alerts=${open}`,
+        `tz=${r.tz}  max-interval=${maxIntervalText(r.maxInterval)}  open alerts=${open}`,
     );
   }
   return 0;
@@ -518,6 +557,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
   const alertIds = new Set(state.alerts.map((a) => a.id));
 
   const threshold = rule.thresholdMilli;
+  const limited = rule.maxInterval !== undefined;
   const lines: string[] = [];
   for (const { label, day } of localDateRange(fmt, opts.from, opts.to)) {
     if (day === null) {
@@ -525,12 +565,13 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
       lines.push(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})  no alert action`);
       continue;
     }
-    const stats = computeRuleDay(env, day);
-    const coverage = coverageSuffix(stats);
+    const stats = computeRuleDay(env, day, rule.maxInterval);
+    const coverage = coverageSuffix(stats, limited);
     if (stats.unknown > 0 || stats.anomaly > 0) {
       // 有未知或下降覆盖:不可判定,不触发也不恢复。
       lines.push(`  ${label}  undecidable (${coverage})  no alert action`);
       lines.push(...periodLines(day));
+      lines.push(...gapLines(stats, rule));
       continue;
     }
     const exceeded = stats.consumption > threshold;
@@ -590,7 +631,8 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
+      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}`,
   );
   for (const line of lines) console.log(line);
   return 0;
@@ -637,7 +679,8 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
   }
 
   console.log(
-    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  tz=${rule.tz}`,
+    `rule: ${rule.id}  ${targetLabel(rule)}  threshold=${formatKwh(rule.thresholdMilli)} kWh  ` +
+      `tz=${rule.tz}  max-interval=${maxIntervalText(rule.maxInterval)}`,
   );
   if (labels.length === 0) {
     console.log(`  no alerts recorded for rule '${rule.id}'`);
@@ -652,22 +695,24 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
   for (const e of localDateRange(fmt, labels[0], endLabel)) byLabel.set(e.label, e.day);
 
   const threshold = rule.thresholdMilli;
+  const limited = rule.maxInterval !== undefined;
   for (const label of labels) {
     const day = byLabel.get(label) ?? null;
     if (day === null) {
       console.log(`  ${label}  SKIPPED (no such local date in timezone ${rule.tz})`);
     } else {
-      const stats = computeRuleDay(env, day);
+      const stats = computeRuleDay(env, day, rule.maxInterval);
       if (stats.unknown > 0 || stats.anomaly > 0) {
-        console.log(`  ${label}  undecidable (${coverageSuffix(stats)})`);
+        console.log(`  ${label}  undecidable (${coverageSuffix(stats, limited)})`);
       } else {
         const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
         console.log(
           `  ${label}  consumption=${formatKwh(stats.consumption)} kWh ` +
-            `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)  ${coverageSuffix(stats)}`,
+            `(${verdict}, threshold=${formatKwh(rule.thresholdMilli)} kWh)  ${coverageSuffix(stats, limited)}`,
         );
       }
       for (const line of periodLines(day)) console.log(line);
+      for (const line of gapLines(stats, rule)) console.log(line);
     }
     const alerts = state.alerts
       .filter((a) => a.ruleId === rule.id && a.date === label)
