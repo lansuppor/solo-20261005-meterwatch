@@ -86,7 +86,7 @@ export interface AlertRecord {
   events: AlertEvent[];
 }
 
-interface AlertState {
+export interface AlertState {
   nextAlertNum: number;
   nextEventSeq: number;
   rules: AlertRule[];
@@ -106,23 +106,13 @@ function targetLabel(rule: Pick<AlertRule, 'targetType' | 'targetId'>): string {
   return `${rule.targetType}=${rule.targetId}`;
 }
 
-/** 读取告警存储;文件不存在返回空状态,存在但无法读取或内容损坏抛出 StoreError。 */
-function loadAlertState(path: string): AlertState {
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState();
-    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
-  }
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new StoreError(`storage file ${path} is corrupted (invalid JSON)`);
-  }
+/**
+ * 解析告警存储的 JSON 结构。结构非法抛出 StoreError;source 用于错误消息
+ * (如 `storage file <path>`)。旧版仅含 device 字段、无时区的规则按 UTC 读入。
+ */
+export function parseAlertState(data: unknown, source: string): AlertState {
   const bad = (what: string): StoreError =>
-    new StoreError(`storage file ${path} is corrupted (${what})`);
+    new StoreError(`${source} is corrupted (${what})`);
   const o = data as Record<string, unknown>;
   if (o === null || typeof o !== 'object') throw bad('not an object');
   if (!Number.isSafeInteger(o.nextAlertNum) || (o.nextAlertNum as number) < 1) {
@@ -225,6 +215,39 @@ function loadAlertState(path: string): AlertState {
   };
 }
 
+/** 读取告警存储;文件不存在返回空状态,存在但无法读取或内容损坏抛出 StoreError。 */
+export function loadAlertState(path: string): AlertState {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState();
+    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new StoreError(`storage file ${path} is corrupted (invalid JSON)`);
+  }
+  return parseAlertState(data, `storage file ${path}`);
+}
+
+/** 序列化为告警存储文件的 JSON 结构(阈值为十进制字符串,任意大数精确)。 */
+export function serializeAlertState(state: AlertState): Record<string, unknown> {
+  return {
+    version: 2,
+    ...state,
+    rules: state.rules.map((r) => ({
+      id: r.id,
+      targetType: r.targetType,
+      targetId: r.targetId,
+      thresholdMilli: r.thresholdMilli.toString(),
+      tz: r.tz,
+    })),
+  };
+}
+
 /**
  * 原子写入告警存储;失败抛错,原有数据保持不变。
  * 告警写入不触碰读数与成员版本文件。
@@ -232,22 +255,7 @@ function loadAlertState(path: string): AlertState {
 function saveAlertState(path: string, state: AlertState): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  const body =
-    JSON.stringify(
-      {
-        version: 2,
-        ...state,
-        rules: state.rules.map((r) => ({
-          id: r.id,
-          targetType: r.targetType,
-          targetId: r.targetId,
-          thresholdMilli: r.thresholdMilli.toString(),
-          tz: r.tz,
-        })),
-      },
-      null,
-      2,
-    ) + '\n';
+  const body = JSON.stringify(serializeAlertState(state), null, 2) + '\n';
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);

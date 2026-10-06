@@ -3,6 +3,7 @@ import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
+import { cmdBackup, cmdRestore, recoverInterruptedRestore } from './src/backup.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -41,6 +42,22 @@ Usage:
   node app.ts undo --request <id> --target <修正请求标识>
                                     整批撤销一次已成功修正(恢复实际改变过的读数)
   node app.ts corrections             查看修正与撤销历史(只读)
+  node app.ts backup <快照文件>       导出全库快照(快照文件须位于数据目录之外,已存在则拒绝)
+  node app.ts restore <快照文件>      从快照整库恢复(三个业务存储作为一次提交整体替换)
+
+备份与恢复(backup / restore):
+  backup 把当前数据目录的三个业务存储(读数与修正/撤销历史、告警规则与历史、
+  分组成员版本)连同后续编号状态完整导出为一个快照文件,任意大数精确保留;
+  快照带格式版本与 SHA-256 完整性校验。快照文件必须位于数据目录之外,已存在
+  的输出文件拒绝覆盖;备份只读取业务数据,不改写。restore 不解析当前库(可用于
+  当前存储已损坏的目录),先校验快照的版本、完整性与三个存储的结构和关联
+  (全库重复读数身份、修正项引用缺失读数、撤销引用缺失修正、成员或规则目标
+  不存在、告警引用缺失规则,任一问题指出原因并拒绝),再把三个业务存储作为
+  一次提交整体替换:成功后业务状态完全等于快照,快照为空的部分清除原数据,
+  快照之后新增的读数、请求和告警不保留,目录内其他文件保持不变,不自动评估
+  或重新生成历史。读写或重命名失败保留恢复前全部状态;进程在提交中断后,任一
+  命令再次启动会先恢复为完整旧状态或完整快照状态,绝不使用混合状态。备份与
+  恢复执行期间对数据目录持有排他锁,不与其他进程同时读写同一目录。
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -548,6 +565,14 @@ function main(args: string[]): number {
     return 0;
   }
 
+  // 上次恢复若在提交中断,先把数据目录恢复为完整旧状态或完整快照状态;
+  // 无法完成时明确报错,绝不查询或修改混合状态。
+  const recoveryError = recoverInterruptedRestore();
+  if (recoveryError !== null) {
+    console.error(`${name}: ${recoveryError}`);
+    return 1;
+  }
+
   if (cmd === 'import') {
     if (rest.length !== 1) return usageError("'import' 需要且仅需要一个 CSV 文件路径");
     return cmdImport(rest[0]);
@@ -595,6 +620,16 @@ function main(args: string[]): number {
     const alertId = rest[0].trim();
     if (alertId === '') return usageError('告警标识不能为空');
     return cmdAck(alertId);
+  }
+
+  if (cmd === 'backup') {
+    if (rest.length !== 1) return usageError("'backup' 需要且仅需要一个快照文件路径(须位于数据目录之外)");
+    return cmdBackup(rest[0]);
+  }
+
+  if (cmd === 'restore') {
+    if (rest.length !== 1) return usageError("'restore' 需要且仅需要一个快照文件路径(须位于数据目录之外)");
+    return cmdRestore(rest[0]);
   }
 
   return usageError(`无法识别的参数 '${cmd}'`);

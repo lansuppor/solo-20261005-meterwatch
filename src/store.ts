@@ -56,21 +56,23 @@ export interface StoreData {
 
 export class StoreError extends Error {}
 
+/** 数据目录:环境变量 METERWATCH_DATA_DIR 指定,默认 ~/.meterwatch。 */
+export function dataDirPath(): string {
+  return process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
+}
+
 export function dataFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'readings.json');
+  return join(dataDirPath(), 'readings.json');
 }
 
 /** 告警规则与历史的存储文件,与读数文件同目录、相互独立。 */
 export function alertFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'alerts.json');
+  return join(dataDirPath(), 'alerts.json');
 }
 
 /** 分组配置的存储文件,与读数、告警文件同目录、相互独立。 */
 export function groupFilePath(): string {
-  const dir = process.env.METERWATCH_DATA_DIR ?? join(homedir(), '.meterwatch');
-  return join(dir, 'groups.json');
+  return join(dataDirPath(), 'groups.json');
 }
 
 /**
@@ -167,6 +169,56 @@ function parseStoredUndos(value: unknown, corrections: Correction[]): UndoRecord
   return out;
 }
 
+/**
+ * 解析读数存储的 JSON 结构(读数与修正、撤销历史)。
+ * 结构非法抛出 StoreError;source 用于错误消息(如 `storage file <path>`)。
+ */
+export function parseStoreData(data: unknown, source: string): StoreData {
+  const bad = (what: string): StoreError => new StoreError(`${source} is corrupted (${what})`);
+  const readings = (data as { readings?: unknown })?.readings;
+  if (!Array.isArray(readings)) throw bad('missing readings array');
+  const out: Reading[] = [];
+  for (const r of readings as Array<Record<string, unknown>>) {
+    const milli = r !== null && typeof r === 'object' ? parseStoredMilli(r.milli) : null;
+    const ok =
+      r !== null &&
+      typeof r === 'object' &&
+      typeof r.device === 'string' &&
+      r.device.length > 0 &&
+      Number.isSafeInteger(r.ts) &&
+      milli !== null;
+    if (!ok) throw bad('invalid reading entry');
+    out.push({ device: r.device as string, ts: r.ts as number, milli: milli as bigint });
+  }
+  const corrections = parseStoredCorrections((data as { corrections?: unknown })?.corrections);
+  if (corrections === null) throw bad('invalid corrections');
+  const undos = parseStoredUndos((data as { undos?: unknown })?.undos, corrections);
+  if (undos === null) throw bad('invalid undos');
+  return { readings: out, corrections, undos };
+}
+
+/** 序列化为存储文件的 JSON 结构(毫千瓦时为十进制字符串,任意大数精确)。 */
+export function serializeStoreData(data: StoreData): Record<string, unknown> {
+  return {
+    version: 1,
+    readings: data.readings.map((r) => ({ device: r.device, ts: r.ts, milli: r.milli.toString() })),
+    corrections: data.corrections.map((c) => ({
+      requestId: c.requestId,
+      items: c.items.map((it) => ({
+        device: it.device,
+        ts: it.ts,
+        expectedMilli: it.expectedMilli.toString(),
+        replacementMilli: it.replacementMilli.toString(),
+      })),
+    })),
+    undos: data.undos.map((u) => ({
+      requestId: u.requestId,
+      targetId: u.targetId,
+      restored: u.restored,
+    })),
+  };
+}
+
 /** 读取存储(读数与修正历史);文件不存在返回空数据,存在但无法读取或内容损坏抛出 StoreError。 */
 export function loadData(path: string): StoreData {
   let text: string;
@@ -182,34 +234,7 @@ export function loadData(path: string): StoreData {
   } catch {
     throw new StoreError(`storage file ${path} is corrupted (invalid JSON)`);
   }
-  const readings = (data as { readings?: unknown })?.readings;
-  if (!Array.isArray(readings)) {
-    throw new StoreError(`storage file ${path} is corrupted (missing readings array)`);
-  }
-  const out: Reading[] = [];
-  for (const r of readings as Array<Record<string, unknown>>) {
-    const milli = r !== null && typeof r === 'object' ? parseStoredMilli(r.milli) : null;
-    const ok =
-      r !== null &&
-      typeof r === 'object' &&
-      typeof r.device === 'string' &&
-      r.device.length > 0 &&
-      Number.isSafeInteger(r.ts) &&
-      milli !== null;
-    if (!ok) {
-      throw new StoreError(`storage file ${path} is corrupted (invalid reading entry)`);
-    }
-    out.push({ device: r.device as string, ts: r.ts as number, milli: milli as bigint });
-  }
-  const corrections = parseStoredCorrections((data as { corrections?: unknown })?.corrections);
-  if (corrections === null) {
-    throw new StoreError(`storage file ${path} is corrupted (invalid corrections)`);
-  }
-  const undos = parseStoredUndos((data as { undos?: unknown })?.undos, corrections);
-  if (undos === null) {
-    throw new StoreError(`storage file ${path} is corrupted (invalid undos)`);
-  }
-  return { readings: out, corrections, undos };
+  return parseStoreData(data, `storage file ${path}`);
 }
 
 /** 只取读数的便捷封装;语义与 loadData 相同。 */
@@ -221,29 +246,7 @@ export function loadStore(path: string): Reading[] {
 export function saveData(path: string, data: StoreData): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  const body =
-    JSON.stringify(
-      {
-        version: 1,
-        readings: data.readings.map((r) => ({ device: r.device, ts: r.ts, milli: r.milli.toString() })),
-        corrections: data.corrections.map((c) => ({
-          requestId: c.requestId,
-          items: c.items.map((it) => ({
-            device: it.device,
-            ts: it.ts,
-            expectedMilli: it.expectedMilli.toString(),
-            replacementMilli: it.replacementMilli.toString(),
-          })),
-        })),
-        undos: data.undos.map((u) => ({
-          requestId: u.requestId,
-          targetId: u.targetId,
-          restored: u.restored,
-        })),
-      },
-      null,
-      2,
-    ) + '\n';
+  const body = JSON.stringify(serializeStoreData(data), null, 2) + '\n';
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);

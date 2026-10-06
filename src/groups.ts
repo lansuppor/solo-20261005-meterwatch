@@ -45,23 +45,13 @@ function err(message: string): void {
   console.error(`meterwatch: ${message}`);
 }
 
-/** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
-export function loadGroups(path: string): Group[] {
-  let text: string;
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
-  }
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new StoreError(`storage file ${path} is corrupted (invalid JSON)`);
-  }
+/**
+ * 解析分组存储的 JSON 结构。结构非法抛出 StoreError;source 用于错误消息
+ * (如 `storage file <path>`)。
+ */
+export function parseGroups(data: unknown, source: string): Group[] {
   const bad = (what: string): StoreError =>
-    new StoreError(`storage file ${path} is corrupted (${what})`);
+    new StoreError(`${source} is corrupted (${what})`);
   const o = data as Record<string, unknown>;
   if (o === null || typeof o !== 'object') throw bad('not an object');
   if (!Array.isArray(o.groups)) throw bad('missing groups array');
@@ -108,11 +98,34 @@ export function loadGroups(path: string): Group[] {
   return groups;
 }
 
+/** 读取分组存储;文件不存在返回空数组,存在但无法读取或内容损坏抛出 StoreError。 */
+export function loadGroups(path: string): Group[] {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new StoreError(`cannot read storage file ${path}: ${(e as Error).message}`);
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new StoreError(`storage file ${path} is corrupted (invalid JSON)`);
+  }
+  return parseGroups(data, `storage file ${path}`);
+}
+
+/** 序列化为分组存储文件的 JSON 结构。 */
+export function serializeGroups(groups: Group[]): Record<string, unknown> {
+  return { version: 1, groups };
+}
+
 /** 原子写入分组存储;失败抛错,原有数据保持不变。 */
 function saveGroups(path: string, groups: Group[]): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  const body = JSON.stringify({ version: 1, groups }, null, 2) + '\n';
+  const body = JSON.stringify(serializeGroups(groups), null, 2) + '\n';
   try {
     writeFileSync(tmp, body, 'utf8');
     renameSync(tmp, path);
