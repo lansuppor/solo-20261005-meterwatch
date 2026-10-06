@@ -3,7 +3,7 @@ import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
-import { cmdBackup, cmdRestore, recoverInterruptedRestore } from './src/backup.ts';
+import { cmdBackup, cmdRestore, withDirectoryCoordination } from './src/backup.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -55,9 +55,32 @@ Usage:
   不存在、告警引用缺失规则,任一问题指出原因并拒绝),再把三个业务存储作为
   一次提交整体替换:成功后业务状态完全等于快照,快照为空的部分清除原数据,
   快照之后新增的读数、请求和告警不保留,目录内其他文件保持不变,不自动评估
-  或重新生成历史。读写或重命名失败保留恢复前全部状态;进程在提交中断后,任一
-  命令再次启动会先恢复为完整旧状态或完整快照状态,绝不使用混合状态。备份与
-  恢复执行期间对数据目录持有排他锁,不与其他进程同时读写同一目录。
+  或重新生成历史。读写或重命名失败返回 1 并回退到恢复前文件内容与存在状态。
+
+进程在准备、文件替换、失败回滚或启动自恢复中被终止的处理:
+  任一命令(含无参数、--help/-h 与非法参数入口)再次启动,都先取得数据目录
+  操作权并续接未完成恢复,然后才执行查询或写入。恢复日志用阶段记录进度:
+  尚未进入失败回滚的中断可收敛为完整旧库或完整快照;已经进入失败回滚后
+  只能继续还原完整旧库,不能改为前滚;自恢复再次中断仍可续接。回滚中已
+  还原的旧文件不会被误删,原本缺失的业务文件恢复为缺失(不把事务造成的
+  缺文件当成空库)。无法可靠判定或完成一致恢复时返回 1:不输出正常业务
+  结果、不做业务写入,也不删除仍可用于恢复的材料(restore.journal 与
+  *.restore-old / *.restore-new),修好底层读写问题后再运行任一命令即可续接。
+
+目录操作权(排他锁,按数据目录隔离):
+  每个命令从取得目录操作权起先协调再读写。同目录被其他存活进程占用时
+  明确拒绝并返回 1,不读写业务存储,也不清理对方的事务材料;属主退出后
+  可安全接管其未完成恢复;不同数据目录互不阻塞。备份、恢复与启动自恢复
+  期间,其他命令同样受此限制。锁文件为数据目录内的 meterwatch.lock。
+
+故障处理简述:
+  - 命令报 "locked by another live meterwatch process":等占用进程结束,
+    或确认其已退出后删除残留的 meterwatch.lock 再重试。
+  - 报 "cannot complete interrupted restore ... materials were kept":
+    保留目录内 restore.journal 与 *.restore-old/*.restore-new,排除磁盘
+    只读/权限/空间问题后,再运行任意命令完成续接;切勿手工删改这些文件。
+  - 报 restore journal 不可读或无效:目录处于无法自动判定的状态,需用已知
+    完好的快照手工恢复,不要直接在可能混合的目录上继续业务操作。
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -555,6 +578,13 @@ function cmdUndoEntry(rest: string[]): number {
 }
 
 function main(args: string[]): number {
+  // 所有入口(含无参数、--help/-h、非法参数)都先取得数据目录操作权并处理
+  // 未完成恢复,再执行查询或写入;协调失败返回 1,不输出正常业务结果。
+  const result = withDirectoryCoordination<number>(() => runCommand(args));
+  return typeof result === 'number' ? result : 1;
+}
+
+function runCommand(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
     return 0;
@@ -563,14 +593,6 @@ function main(args: string[]): number {
   if (rest.length === 0 && (cmd === '--help' || cmd === '-h')) {
     console.log(help);
     return 0;
-  }
-
-  // 上次恢复若在提交中断,先把数据目录恢复为完整旧状态或完整快照状态;
-  // 无法完成时明确报错,绝不查询或修改混合状态。
-  const recoveryError = recoverInterruptedRestore();
-  if (recoveryError !== null) {
-    console.error(`${name}: ${recoveryError}`);
-    return 1;
   }
 
   if (cmd === 'import') {
