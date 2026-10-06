@@ -3,7 +3,7 @@ import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
-import { cmdBackup, cmdRestore, recoverInterruptedRestore } from './src/backup.ts';
+import { cmdBackup, cmdRestore, recoverInterruptedRestore, acquireDataDir, releaseDataDir } from './src/backup.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -55,9 +55,20 @@ Usage:
   不存在、告警引用缺失规则,任一问题指出原因并拒绝),再把三个业务存储作为
   一次提交整体替换:成功后业务状态完全等于快照,快照为空的部分清除原数据,
   快照之后新增的读数、请求和告警不保留,目录内其他文件保持不变,不自动评估
-  或重新生成历史。读写或重命名失败保留恢复前全部状态;进程在提交中断后,任一
-  命令再次启动会先恢复为完整旧状态或完整快照状态,绝不使用混合状态。备份与
-  恢复执行期间对数据目录持有排他锁,不与其他进程同时读写同一目录。
+  或重新生成历史。读写或重命名失败返回 1 并回退到恢复前全部状态;回退受阻时
+  保留续接所需的恢复材料并明确报错。
+
+目录协调与故障处理:
+  所有命令(含无参数、--help 与非法参数入口)启动时先取得数据目录的排他锁,
+  再处理上次未完成的恢复,然后才执行查询或写入;同目录被其他存活进程占用时
+  明确拒绝并返回 1,不读写业务存储,也不清理对方的恢复材料;属主退出后可
+  安全接管,不同数据目录互不阻塞。恢复在准备、文件替换、失败回滚或启动自
+  恢复任一阶段被中断,下次启动都会续接:尚未进入失败回滚的中断收敛为完整
+  旧库或完整快照;已经进入失败回滚的中断只继续还原完整旧库,不会改为前滚,
+  绝不使用混合状态。无法可靠判定或完成一致恢复时返回 1,保留 restore.journal
+  与 *.restore-old、*.restore-new 恢复材料,不输出业务结果、不执行业务写入;
+  此时不要删除这些文件,排除读写故障后重新执行任一命令即可续接,或用快照
+  重新 restore。
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -554,7 +565,7 @@ function cmdUndoEntry(rest: string[]): number {
   return cmdUndo(requestId, targetId);
 }
 
-function main(args: string[]): number {
+function dispatch(args: string[]): number {
   if (args.length === 0) {
     console.log(help);
     return 0;
@@ -563,14 +574,6 @@ function main(args: string[]): number {
   if (rest.length === 0 && (cmd === '--help' || cmd === '-h')) {
     console.log(help);
     return 0;
-  }
-
-  // 上次恢复若在提交中断,先把数据目录恢复为完整旧状态或完整快照状态;
-  // 无法完成时明确报错,绝不查询或修改混合状态。
-  const recoveryError = recoverInterruptedRestore();
-  if (recoveryError !== null) {
-    console.error(`${name}: ${recoveryError}`);
-    return 1;
   }
 
   if (cmd === 'import') {
@@ -633,6 +636,31 @@ function main(args: string[]): number {
   }
 
   return usageError(`无法识别的参数 '${cmd}'`);
+}
+
+/**
+ * 所有命令入口(含无参数、--help、-h 与非法参数)都先取得数据目录的排他锁,
+ * 再处理上次未完成的恢复,然后才分发执行;协调失败返回 1,不读写业务存储,
+ * 也不清理其他存活进程的恢复材料。
+ */
+function main(args: string[]): number {
+  const lockError = acquireDataDir();
+  if (lockError !== null) {
+    console.error(`${name}: ${lockError}`);
+    return 1;
+  }
+  try {
+    // 上次恢复若在准备、提交、失败回滚或启动自恢复中被中断,先续接为完整
+    // 旧状态或完整快照状态;无法完成时明确报错,绝不查询或修改混合状态。
+    const recoveryError = recoverInterruptedRestore();
+    if (recoveryError !== null) {
+      console.error(`${name}: ${recoveryError}`);
+      return 1;
+    }
+    return dispatch(args);
+  } finally {
+    releaseDataDir();
+  }
 }
 
 process.exitCode = main(process.argv.slice(2));

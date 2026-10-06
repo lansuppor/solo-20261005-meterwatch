@@ -14,10 +14,16 @@
 //   的目录,不解析原库。
 // - 三个业务存储作为一次恢复提交:先写全部新内容到临时文件,再写恢复日志
 //   (journal),然后整体换名提交,最后清理。读写或重命名失败回滚为恢复前
-//   全部状态;进程在提交中断后,任一命令再次启动时先按日志前滚为完整快照
-//   状态或回滚为完整旧状态,绝不查询或修改混合状态,无法完成时明确报错。
-// - 备份与恢复执行期间对数据目录持有排他锁(锁文件,进程退出即 stale 可判),
-//   不与其他进程同时读写同一目录。
+//   全部状态;进入回滚前先把日志标记为 rollback 阶段并落盘,此后(含启动
+//   自恢复)只继续还原完整旧状态,绝不改为前滚造成新旧混合。进程在准备、
+//   提交、失败回滚或启动自恢复任一阶段中断,任一命令再次启动时先按日志
+//   续接:尚未进入回滚的中断收敛为完整旧状态或完整快照状态,已进入回滚的
+//   中断只继续回滚;无法可靠完成时明确报错并保留恢复材料,绝不查询或修改
+//   混合状态。
+// - 所有命令(含无参数、--help 与非法参数入口)启动时都先取得数据目录的
+//   排他锁(锁文件,进程退出即 stale 可判)并完成上述恢复协调,然后才执行
+//   查询或写入;同目录被其他存活进程占用时明确拒绝,不读写业务存储,也不
+//   清理对方的恢复材料;不同数据目录互不阻塞。
 
 import { createHash } from 'node:crypto';
 import {
@@ -185,7 +191,7 @@ function acquireLock(dir: string): string | null {
       }
       if (alive) {
         return (
-          `another backup/restore process${Number.isInteger(pid) && pid > 0 ? ` (pid ${pid})` : ''} ` +
+          `another meterwatch process${Number.isInteger(pid) && pid > 0 ? ` (pid ${pid})` : ''} ` +
           `is operating on data directory ${dir}; wait for it to finish`
         );
       }
@@ -207,13 +213,43 @@ function releaseLock(dir: string): void {
   }
 }
 
+/**
+ * 取得数据目录的操作权:确保目录存在并持有排他锁。所有命令(含无参数、
+ * --help 与非法参数入口)在读写业务存储或清理恢复材料前都必须先取得;
+ * 同目录被其他存活进程占用时返回错误消息,属主退出后自动接管。成功返回
+ * null,失败返回错误消息。
+ */
+export function acquireDataDir(): string | null {
+  const dir = dataDirPath();
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    return `cannot create data directory ${dir}: ${(e as Error).message}`;
+  }
+  return acquireLock(dir);
+}
+
+/** 释放数据目录的排他锁,与 acquireDataDir 配对。 */
+export function releaseDataDir(): void {
+  releaseLock(dataDirPath());
+}
+
 interface JournalFile {
   name: string;
   hadOld: boolean;
 }
 
+/**
+ * 恢复日志阶段:
+ * - commit:尚未进入失败回滚;中断后可前滚为完整快照,也可回滚为完整旧状态。
+ * - rollback:已进入失败回滚;此后只能继续还原完整旧状态,绝不改为前滚,
+ *   否则已还原的旧文件会与未还原的新文件混合。
+ */
+type JournalPhase = 'commit' | 'rollback';
+
 interface Journal {
   files: JournalFile[];
+  phase: JournalPhase;
 }
 
 /** 解析恢复日志;结构非法返回 null(调用方按无法恢复处理,不猜测)。 */
@@ -229,6 +265,12 @@ function parseJournal(data: unknown): Journal | null {
   ) {
     return null;
   }
+  // 旧版日志没有 phase 字段,按 commit 处理;存在但取值未知则无法可靠判定。
+  let phase: JournalPhase = 'commit';
+  if (o.phase !== undefined) {
+    if (o.phase !== 'commit' && o.phase !== 'rollback') return null;
+    phase = o.phase;
+  }
   const files: JournalFile[] = [];
   for (const f of o.files as Array<Record<string, unknown>>) {
     if (
@@ -242,12 +284,38 @@ function parseJournal(data: unknown): Journal | null {
     }
     files.push({ name: f.name, hadOld: f.hadOld });
   }
-  return { files };
+  return { files, phase };
+}
+
+/** 原子写入恢复日志(先写临时文件再换名);失败抛错并清理临时文件。 */
+function writeJournal(dir: string, journal: Journal): void {
+  const journalPath = join(dir, JOURNAL_NAME);
+  const tmp = `${journalPath}.tmp-${process.pid}`;
+  try {
+    writeFileSync(
+      tmp,
+      JSON.stringify(
+        { format: JOURNAL_FORMAT, version: 1, phase: journal.phase, files: journal.files },
+        null,
+        2,
+      ) + '\n',
+      'utf8',
+    );
+    renameSync(tmp, journalPath);
+  } catch (e) {
+    try {
+      rmSync(tmp);
+    } catch {
+      // 临时文件可能未写出;清理失败不掩盖原始错误。
+    }
+    throw e;
+  }
 }
 
 /**
  * 回滚到恢复前状态:凡有旧文件备份的换回原文件,原本不存在的文件删除新文件;
- * 清理临时文件与日志。任何一步失败抛错。
+ * 清理临时文件与日志。任何一步失败抛错。可重复执行:已还原的旧文件不动,
+ * 已恢复为缺失的文件保持缺失,中断后再次调用会从未完成的步骤继续。
  */
 function rollback(dir: string, journal: Journal): void {
   for (const f of journal.files) {
@@ -261,10 +329,19 @@ function rollback(dir: string, journal: Journal): void {
       }
       if (existsSync(target)) rmSync(target);
       renameSync(oldPath, target);
-    } else if (!f.hadOld && !existsSync(newPath) && existsSync(target)) {
-      // 新文件已被换入且原本不存在:删除以恢复原状。
-      rmSync(target);
-    } else if (f.hadOld && !existsSync(target)) {
+    } else if (!f.hadOld) {
+      if (existsSync(newPath) && existsSync(target)) {
+        // 原本不存在的文件同时出现新文件与未提交的临时文件:状态被外部
+        // 破坏,无法可靠判定哪个该保留,不猜测。
+        throw new StoreError(
+          `cannot roll back ${target}: both a new file and its uncommitted temp file exist`,
+        );
+      }
+      if (existsSync(target)) {
+        // 新文件已被换入且原本不存在:删除以恢复缺失状态。
+        rmSync(target);
+      }
+    } else if (!existsSync(target)) {
       // 日志称原有旧文件,但旧备份与原文件都不在:状态不一致,不猜测。
       throw new StoreError(`cannot roll back ${target}: both the original and its backup are missing`);
     }
@@ -313,9 +390,11 @@ function rollForward(dir: string, journal: Journal): void {
 }
 
 /**
- * 任一命令启动时调用:若上次恢复在提交中断,先把数据目录恢复为完整快照
- * 状态(优先)或完整旧状态,绝不留下混合状态。成功(或无需恢复)返回 null,
- * 无法完成返回错误消息。
+ * 任一命令启动时在持有数据目录排他锁的前提下调用:若上次恢复被中断,先把
+ * 数据目录收敛为一致状态——尚未进入失败回滚的中断可前滚为完整快照(优先)
+ * 或回滚为完整旧状态;已进入失败回滚的中断只继续还原完整旧状态,绝不改为
+ * 前滚造成新旧混合。自恢复再次中断仍可续接。成功(或无需恢复)返回 null,
+ * 无法可靠完成返回错误消息,此时保留全部恢复材料,不输出业务结果。
  */
 export function recoverInterruptedRestore(): string | null {
   const dir = dataDirPath();
@@ -330,15 +409,41 @@ export function recoverInterruptedRestore(): string | null {
     if (journal === null) {
       return (
         `cannot recover data directory ${dir}: restore journal ${journalPath} is unreadable or invalid; ` +
-        `the directory may hold a mixed state, restore it manually from a snapshot`
+        `recovery materials were preserved, do not delete them; ` +
+        `fix the problem and rerun any command, or restore manually from a snapshot`
       );
+    }
+    if (journal.phase === 'rollback') {
+      // 上次恢复已进入失败回滚:只能继续还原完整旧状态。
+      try {
+        rollback(dir, journal);
+        console.error('meterwatch: completed an interrupted restore rollback: previous state preserved');
+        return null;
+      } catch (e) {
+        return (
+          `cannot finish rolling back data directory ${dir} to its previous state: ${(e as Error).message}; ` +
+          `recovery materials were preserved and the rollback will resume on the next command`
+        );
+      }
     }
     try {
       rollForward(dir, journal);
       console.error('meterwatch: completed an interrupted restore: snapshot state committed');
       return null;
     } catch {
-      // 前滚失败则尝试回滚为完整旧状态。
+      // 前滚失败则转入失败回滚。
+    }
+    // 进入回滚前先把阶段标记落盘:否则本进程在回滚途中再被终止时,下次启动
+    // 会按 commit 日志尝试前滚,把已还原的旧文件与未还原的新文件混用。
+    // 标记写不进去就不开始回滚,保留材料,下次启动仍可按 commit 日志收敛。
+    try {
+      writeJournal(dir, { files: journal.files, phase: 'rollback' });
+    } catch (e) {
+      return (
+        `cannot recover data directory ${dir}: roll-forward failed and the rollback marker could not ` +
+        `be written (${(e as Error).message}); recovery materials were preserved, do not delete them; ` +
+        `fix the problem and rerun any command, or restore manually from a snapshot`
+      );
     }
     try {
       rollback(dir, journal);
@@ -347,7 +452,7 @@ export function recoverInterruptedRestore(): string | null {
     } catch (e) {
       return (
         `cannot recover data directory ${dir} to a consistent state: ${(e as Error).message}; ` +
-        `restore it manually from a snapshot`
+        `recovery materials were preserved and the rollback will resume on the next command`
       );
     }
   }
@@ -368,13 +473,14 @@ export function recoverInterruptedRestore(): string | null {
 }
 
 /**
- * 把三个业务存储的新内容作为一次恢复提交。失败抛 StoreError 并尽力回滚为
- * 提交前状态;回滚也失败时错误中明确说明目录可能处于混合状态。
+ * 把三个业务存储的新内容作为一次恢复提交。失败抛 StoreError 并回滚为提交前
+ * 状态;回滚也无法完成时保留续接所需的日志与备份材料,错误中明确说明。
  */
 function commitRestore(dir: string, files: Array<{ path: string; body: string }>): void {
   const journalPath = join(dir, JOURNAL_NAME);
   const journal: Journal = {
     files: files.map((f) => ({ name: basename(f.path), hadOld: existsSync(f.path) })),
+    phase: 'commit',
   };
 
   // 阶段一:写全部新内容到临时文件,再原子写入恢复日志。此阶段失败或中断
@@ -383,13 +489,7 @@ function commitRestore(dir: string, files: Array<{ path: string; body: string }>
     for (const f of files) {
       writeFileSync(f.path + NEW_SUFFIX, f.body, 'utf8');
     }
-    const journalTmp = `${journalPath}.tmp-${process.pid}`;
-    writeFileSync(
-      journalTmp,
-      JSON.stringify({ format: JOURNAL_FORMAT, version: 1, files: journal.files }, null, 2) + '\n',
-      'utf8',
-    );
-    renameSync(journalTmp, journalPath);
+    writeJournal(dir, journal);
   } catch (e) {
     for (const f of files) {
       try {
@@ -402,42 +502,42 @@ function commitRestore(dir: string, files: Array<{ path: string; body: string }>
   }
 
   // 阶段二:整体换名提交(旧文件换为备份,新文件换入),然后删除日志与备份。
-  // 此阶段中断由下次启动按日志前滚或回滚;受控失败按已完成的步骤精确回滚
-  // (只动本次自己换名的文件,不触碰目录内任何其他文件)。
-  const movedToOld: string[] = [];
-  const movedIn: string[] = [];
+  // 此阶段中断由下次启动按日志前滚或回滚;受控失败先进入失败回滚:把日志
+  // 标记为 rollback 阶段并落盘,再逐步还原为提交前状态(只动本次自己换名
+  // 的文件,不触碰目录内任何其他文件)。
   try {
     for (const f of files) {
       if (existsSync(f.path)) {
         renameSync(f.path, f.path + OLD_SUFFIX);
-        movedToOld.push(f.path);
       }
     }
     for (const f of files) {
       renameSync(f.path + NEW_SUFFIX, f.path);
-      movedIn.push(f.path);
     }
     rmSync(journalPath);
     for (const f of files) {
       if (existsSync(f.path + OLD_SUFFIX)) rmSync(f.path + OLD_SUFFIX);
     }
   } catch (e) {
+    // 先落盘回滚标记:本进程在回滚途中被终止时,下次启动只会继续回滚为
+    // 完整旧状态,不会改为前滚造成混合状态。标记写不进去就不动任何文件,
+    // 保留材料,下次启动仍可按 commit 日志收敛为完整快照。
     try {
-      // 撤销已换入的新文件,再把已换出的旧文件换回原位;未完成的步骤不动。
-      for (const path of movedIn) {
-        if (existsSync(path)) rmSync(path);
-      }
-      for (const path of movedToOld) {
-        renameSync(path + OLD_SUFFIX, path);
-      }
-      for (const f of files) {
-        if (existsSync(f.path + NEW_SUFFIX)) rmSync(f.path + NEW_SUFFIX);
-      }
-      rmSync(journalPath);
+      writeJournal(dir, { files: journal.files, phase: 'rollback' });
+    } catch (me) {
+      throw new StoreError(
+        `restore failed (${(e as Error).message}) and the rollback marker could not be written ` +
+          `(${(me as Error).message}); nothing was rolled back; recovery materials were preserved ` +
+          `and the next command will converge the directory`,
+      );
+    }
+    try {
+      rollback(dir, journal);
     } catch (re) {
       throw new StoreError(
-        `restore failed (${(e as Error).message}) and rollback also failed (${(re as Error).message}); ` +
-          `data directory ${dir} may be in a mixed state, restore it manually from a snapshot`,
+        `restore failed (${(e as Error).message}) and rollback could not finish (${(re as Error).message}); ` +
+          `recovery materials were preserved and the rollback will resume on the next command; ` +
+          `if it keeps failing, restore manually from a snapshot`,
       );
     }
     throw new StoreError(`restore failed: ${(e as Error).message}; previous state preserved`);
@@ -456,7 +556,8 @@ function countsReport(data: StoreData, alerts: AlertState, groups: Group[]): str
 
 /**
  * 导出全库快照。只读取业务存储,不改写业务数据;输出文件必须位于数据目录
- * 之外且不得已存在。返回进程退出码。
+ * 之外且不得已存在。调用前须已由命令入口取得数据目录排他锁并完成中断恢复
+ * 的协调。返回进程退出码。
  */
 export function cmdBackup(outPath: string): number {
   const dir = dataDirPath();
@@ -465,85 +566,76 @@ export function cmdBackup(outPath: string): number {
     return 2;
   }
 
-  mkdirSync(dir, { recursive: true });
-  const lockError = acquireLock(dir);
-  if (lockError !== null) {
-    err(lockError);
+  let data: StoreData;
+  let alerts: AlertState;
+  let groups: Group[];
+  try {
+    data = loadData(dataFilePath());
+    alerts = loadAlertState(alertFilePath());
+    groups = loadGroups(groupFilePath());
+  } catch (e) {
+    if (e instanceof StoreError) {
+      err(e.message);
+      return 1;
+    }
+    throw e;
+  }
+
+  const problems = validateStores(data, alerts, groups);
+  if (problems.length > 0) {
+    for (const p of problems) err(p);
+    err(`backup rejected: ${problems.length} consistency problem(s); no snapshot was written`);
     return 1;
   }
+
+  const payload = {
+    readings: serializeStoreData(data),
+    alerts: serializeAlertState(alerts),
+    groups: serializeGroups(groups),
+  };
+  const checksum = createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex');
+  const body =
+    JSON.stringify(
+      {
+        format: SNAPSHOT_FORMAT,
+        version: SNAPSHOT_VERSION,
+        checksum: `sha256:${checksum}`,
+        payload,
+      },
+      null,
+      2,
+    ) + '\n';
+
+  // 先写临时文件,再原子链接为最终名:已存在的输出拒绝覆盖,失败不留下
+  // 可被当作成功快照的输出。
+  const out = resolve(outPath);
+  const tmp = `${out}.tmp-${process.pid}`;
   try {
-    let data: StoreData;
-    let alerts: AlertState;
-    let groups: Group[];
-    try {
-      data = loadData(dataFilePath());
-      alerts = loadAlertState(alertFilePath());
-      groups = loadGroups(groupFilePath());
-    } catch (e) {
-      if (e instanceof StoreError) {
-        err(e.message);
-        return 1;
-      }
-      throw e;
+    writeFileSync(tmp, body, 'utf8');
+    linkSync(tmp, out);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+      err(`output file '${outPath}' already exists; refusing to overwrite`);
+    } else {
+      err(`cannot write snapshot '${outPath}': ${(e as Error).message}`);
     }
-
-    const problems = validateStores(data, alerts, groups);
-    if (problems.length > 0) {
-      for (const p of problems) err(p);
-      err(`backup rejected: ${problems.length} consistency problem(s); no snapshot was written`);
-      return 1;
-    }
-
-    const payload = {
-      readings: serializeStoreData(data),
-      alerts: serializeAlertState(alerts),
-      groups: serializeGroups(groups),
-    };
-    const checksum = createHash('sha256').update(JSON.stringify(payload), 'utf8').digest('hex');
-    const body =
-      JSON.stringify(
-        {
-          format: SNAPSHOT_FORMAT,
-          version: SNAPSHOT_VERSION,
-          checksum: `sha256:${checksum}`,
-          payload,
-        },
-        null,
-        2,
-      ) + '\n';
-
-    // 先写临时文件,再原子链接为最终名:已存在的输出拒绝覆盖,失败不留下
-    // 可被当作成功快照的输出。
-    const out = resolve(outPath);
-    const tmp = `${out}.tmp-${process.pid}`;
-    try {
-      writeFileSync(tmp, body, 'utf8');
-      linkSync(tmp, out);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-        err(`output file '${outPath}' already exists; refusing to overwrite`);
-      } else {
-        err(`cannot write snapshot '${outPath}': ${(e as Error).message}`);
-      }
-      return 1;
-    } finally {
-      try {
-        rmSync(tmp);
-      } catch {
-        // 临时文件可能未创建;清理失败不影响结果。
-      }
-    }
-
-    console.log(`snapshot written to '${outPath}': ${countsReport(data, alerts, groups)}`);
-    return 0;
+    return 1;
   } finally {
-    releaseLock(dir);
+    try {
+      rmSync(tmp);
+    } catch {
+      // 临时文件可能未创建;清理失败不影响结果。
+    }
   }
+
+  console.log(`snapshot written to '${outPath}': ${countsReport(data, alerts, groups)}`);
+  return 0;
 }
 
 /**
  * 从快照整库恢复。快照须通过格式版本与完整性校验,且三个业务存储的结构与
- * 关联一致,否则不开始替换。成功后业务状态完全等于快照。返回进程退出码。
+ * 关联一致,否则不开始替换。成功后业务状态完全等于快照。调用前须已由命令
+ * 入口取得数据目录排他锁并完成中断恢复的协调。返回进程退出码。
  */
 export function cmdRestore(snapshotPath: string): number {
   const dir = dataDirPath();
@@ -608,11 +700,6 @@ export function cmdRestore(snapshotPath: string): number {
   }
 
   mkdirSync(dir, { recursive: true });
-  const lockError = acquireLock(dir);
-  if (lockError !== null) {
-    err(lockError);
-    return 1;
-  }
   try {
     commitRestore(dir, [
       { path: dataFilePath(), body: JSON.stringify(serializeStoreData(data), null, 2) + '\n' },
@@ -625,8 +712,6 @@ export function cmdRestore(snapshotPath: string): number {
       return 1;
     }
     throw e;
-  } finally {
-    releaseLock(dir);
   }
 
   console.log(`restored from snapshot '${snapshotPath}': ${countsReport(data, alerts, groups)}`);
