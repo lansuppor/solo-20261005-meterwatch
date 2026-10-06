@@ -175,6 +175,37 @@ export function localDays(fmt: Intl.DateTimeFormat, from: number, to: number): L
   return days;
 }
 
+export interface WallSegment {
+  /** 段起点(含),epoch 秒。 */
+  start: number;
+  /** 段终点(不含),epoch 秒。 */
+  end: number;
+  /** 段内当地日期标签,YYYY-MM-DD。 */
+  label: string;
+  /** 段内恒定偏移(墙钟 - UTC),秒。 */
+  offset: number;
+}
+
+/**
+ * 把 [from, to) 切成偏移恒定、当地日期单一的最细时段:在当地午夜与偏移
+ * 切换(夏令时)处切开,不像 localDays 那样把同日的相邻段合并。段内墙钟
+ * 随 UTC 线性平移(wall = utc + offset),供按当地墙钟分类的口径使用。
+ */
+export function wallSegments(fmt: Intl.DateTimeFormat, from: number, to: number): WallSegment[] {
+  const segs: WallSegment[] = [];
+  let cursor = from;
+  while (cursor < to) {
+    const w = wallClock(fmt, cursor);
+    const o0 = w.naive - cursor;
+    const uStar = w.nextMidnight - o0;
+    const trans = nextTransition(fmt, cursor, o0, Math.min(uStar, to));
+    const end = Math.min(uStar, trans, to);
+    segs.push({ start: cursor, end, label: w.label, offset: o0 });
+    cursor = end;
+  }
+  return segs;
+}
+
 export interface LocalDateEntry {
   /** 当地日期标签,YYYY-MM-DD,按当地日期升序。 */
   label: string;
