@@ -419,6 +419,19 @@ function coverageSuffix(
   return limited ? `${base} gap=${stats.gapUnknown}s` : base;
 }
 
+/**
+ * 消耗比较短语:无有效覆盖时明确表示消耗无法计算(不显示 0、也不触发或恢复);
+ * 有效(含零增长)时给出固定三位小数消耗及与阈值的比较。
+ */
+function consumptionCompare(stats: DayStats, threshold: bigint): string {
+  if (stats.valid === 0) return 'consumption=n/a (no valid coverage)';
+  const exceeded = stats.consumption > threshold;
+  return (
+    `consumption=${formatKwh(stats.consumption)} kWh ` +
+    `${exceeded ? '>' : '<='} threshold=${formatKwh(threshold)} kWh`
+  );
+}
+
 /** 一天各实际 UTC 时段的展示行(时段按实际时刻升序)。 */
 function periodLines(periods: LocalDayPeriod[]): string[] {
   return periods.map((p) => `    period=${formatIsoUtc(p.start)}..${formatIsoUtc(p.end)}`);
@@ -700,16 +713,19 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
     const stats = computeRuleDay(env, periods, rule.maxInterval);
     const coverage = coverageSuffix(stats, limited);
     if (stats.unknown > 0 || stats.anomaly > 0) {
-      // 有未知或下降覆盖:不可判定,不触发也不恢复。
-      lines.push(`  ${label}  undecidable (${coverage})  no alert action`);
+      // 有未知或下降覆盖:不可判定,不触发也不恢复。无有效覆盖时明确显示
+      // 消耗无法计算(不显示 0);仍有部分有效覆盖时只给覆盖与原因,不与阈值比较。
+      const head =
+        stats.valid === 0
+          ? `  ${label}  undecidable  ${consumptionCompare(stats, threshold)}  (${coverage})  no alert action`
+          : `  ${label}  undecidable (${coverage})  no alert action`;
+      lines.push(head);
       lines.push(...periodLines(periods));
       lines.push(...gapLines(stats, rule));
       continue;
     }
     const exceeded = stats.consumption > threshold;
-    const cmp =
-      `consumption=${formatKwh(stats.consumption)} kWh ` +
-      `${exceeded ? '>' : '<='} threshold=${formatKwh(rule.thresholdMilli)} kWh`;
+    const cmp = consumptionCompare(stats, threshold);
     const open = state.alerts.find(
       (a) => a.ruleId === rule.id && a.date === label && a.status === 'triggered',
     );
@@ -842,7 +858,12 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
       } else {
         const stats = computeRuleDay(env, periods, rule.maxInterval);
         if (stats.unknown > 0 || stats.anomaly > 0) {
-          console.log(`  ${label}  undecidable (${coverageSuffix(stats, limited)})`);
+          // 不可判定;无有效覆盖时明确显示消耗无法计算,不显示 0 或与阈值比较。
+          const head =
+            stats.valid === 0
+              ? `  ${label}  undecidable  ${consumptionCompare(stats, threshold)}  (${coverageSuffix(stats, limited)})`
+              : `  ${label}  undecidable (${coverageSuffix(stats, limited)})`;
+          console.log(head);
         } else {
           const verdict = stats.consumption > threshold ? 'EXCEEDED' : 'NORMAL';
           console.log(
