@@ -4,7 +4,7 @@ import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './sr
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdGroupScheduleReport, canonicalizeExceptions, canonicalizeWindows, parseSchedule } from './src/schedule.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
-import { cmdBackup, cmdRestore, withDirectoryCoordination } from './src/backup.ts';
+import { cmdBackup, cmdRescue, cmdRestore, withDirectoryCoordination, withRescueCoordination } from './src/backup.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
 import { canonicalTimezone, loadTimezone } from './src/tz.ts';
 import { parseKwh } from './src/value.ts';
@@ -52,6 +52,8 @@ Usage:
   node app.ts corrections             查看修正与撤销历史(只读)
   node app.ts backup <快照文件>       导出全库快照(快照文件须位于数据目录之外,已存在则拒绝)
   node app.ts restore <快照文件>      从快照整库恢复(三个业务存储作为一次提交整体替换)
+  node app.ts rescue <快照文件>       显式快照救援:留存当前材料后放弃无法续接的旧事务,
+                                    整库替换为校验过的快照(仅恢复日志损坏阻塞入口时使用)
 
 备份与恢复(backup / restore):
   backup 把当前数据目录的三个业务存储(读数与修正/撤销历史、告警规则与历史、
@@ -75,6 +77,26 @@ Usage:
   结果、不做业务写入,也不删除仍可用于恢复的材料(restore.journal 与
   *.restore-old / *.restore-new),修好底层读写问题后再运行任一命令即可续接。
 
+快照救援(rescue,必须显式选择,普通 restore 绝不隐式绕过恢复):
+  恢复日志 restore.journal 无法解析或含显式未知阶段时,普通命令(含
+  restore)一律返回 1,保留业务文件与全部恢复材料,不输出正常结果、不
+  猜测前滚方向。此时可用 rescue 显式放弃无法可靠续接的旧事务:不解析
+  当前库与旧日志,三个业务文件损坏、缺失或混杂均可。rescue 同样先取得
+  目录操作权(被其他存活进程占用时返回 1,不动其材料),并先校验快照的
+  格式、版本、校验和与三个存储的结构和关联(规则与 restore 相同,沿用
+  旧快照兼容规则);快照无效返回 1、参数非法返回 2,都不改动原库与旧
+  事务材料。替换前把救援前的三个业务文件、restore.journal 及对应
+  *.restore-old/*.restore-new 的原始字节与缺失状态完整留存到数据目录的
+  rescue-preserved-<序号>/ 并报告保存位置;留存不完整绝不替换,留存材料
+  不被启动或后续恢复自动清理,目录内其他已有文件不变。成功返回 0:三个
+  存储整体等于快照,空部分清除原数据,不自动评估;精确读数、修正撤销
+  重放与来源约束、成员版本、规则、告警历史与后续编号保持可用。救援中的
+  读写或重命名失败返回 1 并还原救援前状态;还原受阻则保留全部材料并阻止
+  业务。救援在留存、替换或回退中被中断后,任一命令启动先续接为完整快照
+  或完整退回救援前的受阻状态,不开放混合库;确定回退后不得改向。退回后
+  原损坏日志恢复到位,普通命令继续拒绝,仍可再次显式 rescue;重复启动
+  不丢材料、不改写历史。
+
 目录操作权(排他锁,按数据目录隔离):
   每个命令从取得目录操作权起先协调再读写。同目录被其他存活进程占用时
   明确拒绝并返回 1,不读写业务存储,也不清理对方的事务材料;属主退出后
@@ -87,8 +109,15 @@ Usage:
   - 报 "cannot complete interrupted restore ... materials were kept":
     保留目录内 restore.journal 与 *.restore-old/*.restore-new,排除磁盘
     只读/权限/空间问题后,再运行任意命令完成续接;切勿手工删改这些文件。
-  - 报 restore journal 不可读或无效:目录处于无法自动判定的状态,需用已知
-    完好的快照手工恢复,不要直接在可能混合的目录上继续业务操作。
+  - 报 restore journal 不可读或无效:目录处于无法自动判定的状态,普通命令
+    (含 restore)都会拒绝。检查 restore.journal 与 *.restore-old/*.restore-new;
+    确认旧事务无法续接后,用已知完好的快照显式救援:
+      node app.ts rescue <快照文件>
+    救援会先留存当前全部材料(见 rescue-preserved-<序号>/),再整库替换为
+    快照;切勿手工删改这些文件,也不要在可能混合的目录上继续业务操作。
+  - 报 rescue journal 不可读或无效,或 "cannot complete interrupted rescue":
+    救援自身被中断且无法自动续接。保留 rescue.journal、rescue-preserved-*/
+    与 *.rescue-new,排除磁盘只读/权限/空间问题后再运行任意命令续接。
 
 筛选(readings):
   --device <id>     只显示指定设备(可重复使用,区分大小写)
@@ -777,8 +806,20 @@ function cmdUndoEntry(rest: string[]): number {
 }
 
 function main(args: string[]): number {
-  // 所有入口(含无参数、--help/-h、非法参数)都先取得数据目录操作权并处理
-  // 未完成恢复,再执行查询或写入;协调失败返回 1,不输出正常业务结果。
+  // 救援入口单独协调:先取得目录操作权并续接上次被中断的救援,但绝不续接
+  // 旧 restore 事务——那正是救援要留存并放弃的对象;恢复日志损坏不再阻塞
+  // 救援入口。其余所有入口(含无参数、--help/-h、非法参数)都先完成启动
+  // 自恢复协调,再执行查询或写入;协调失败返回 1,不输出正常业务结果。
+  const [cmd, ...rest] = args;
+  if (cmd === 'rescue') {
+    const result = withRescueCoordination<number>(() => {
+      if (rest.length !== 1) {
+        return usageError("'rescue' 需要且仅需要一个快照文件路径(须位于数据目录之外)");
+      }
+      return cmdRescue(rest[0]);
+    });
+    return typeof result === 'number' ? result : 1;
+  }
   const result = withDirectoryCoordination<number>(() => runCommand(args));
   return typeof result === 'number' ? result : 1;
 }

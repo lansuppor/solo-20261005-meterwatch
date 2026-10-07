@@ -16,7 +16,7 @@
 // 互相比较来充当预期值。
 
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync, mkdirSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1012,6 +1012,333 @@ function scenarioExceptionDst() {
   }
 }
 
+// R1:恢复日志损坏后普通命令(含 restore)一律拒绝,只有显式 rescue 能放弃旧事务;
+// 留存原始字节与缺失状态、序号递增不丢材料、快照/参数/锁的前置校验不改动现场。
+function scenarioRescue() {
+  const S = 'R1 explicit rescue after unrecoverable restore journal';
+  const dir = makeDataDir();
+  const snapDir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), ['device,time,reading',
+      'm,2026-01-05T00:00:00Z,0.000',
+      'm,2026-01-06T00:00:00Z,2.000',
+      '',
+    ].join('\n'));
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    r = run(dir, ['correct', '--request', 'REQ1',
+      '--item', '--device', 'm', '--at', '2026-01-06T00:00:00Z', '--expect', '2.000', '--set', '3.000']);
+    check(S, r.code === 0, `correct rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g', '--at', '2026-01-01T00:00:00Z', '--device', 'm']);
+    check(S, r.code === 0, `group rc=${r.code} ${r.err}`);
+    r = run(dir, ['rule', 'create', '--id', 'nr', '--group', 'g', '--threshold', '1']);
+    check(S, r.code === 0, `rule rc=${r.code} ${r.err}`);
+    const snap = join(snapDir, 'snap.json');
+    r = run(dir, ['backup', snap]);
+    check(S, r.code === 0, `backup rc=${r.code} ${r.err}`);
+
+    // 损坏恢复日志 + 旧事务材料 + 损坏业务文件(混合现场)。
+    const junkJournal = 'not json {{';
+    write(join(dir, 'restore.journal'), junkJournal);
+    write(join(dir, 'readings.json.restore-old'), 'junk-old');
+    write(join(dir, 'groups.json.restore-new'), 'junk-new');
+    write(join(dir, 'alerts.json'), 'corrupt-business');
+    const before = storeSnapshot(dir);
+
+    // 普通命令拒绝(返回 1),业务文件与恢复材料原样保留。
+    r = run(dir, ['readings']);
+    check(S, r.code === 1 && /restore journal/.test(r.err) && !/device: /.test(r.out),
+      `normal command must refuse without business output: rc=${r.code}\n${r.out}`);
+    check(S, sameSnapshot(before, storeSnapshot(dir)) === null, 'business files untouched after refusal');
+    check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === junkJournal, 'corrupt journal kept');
+
+    // 普通 restore 不得隐式绕过恢复。
+    r = run(dir, ['restore', snap]);
+    check(S, r.code === 1 && /restore journal/.test(r.err), `plain restore must not bypass recovery: rc=${r.code}`);
+    check(S, sameSnapshot(before, storeSnapshot(dir)) === null, 'plain restore changed nothing');
+
+    // 显式未知阶段同样无法自动判定,普通命令拒绝。
+    write(join(dir, 'restore.journal'), JSON.stringify({
+      format: 'meterwatch-restore-journal', version: 1, phase: 'exploding',
+      files: [{ name: 'readings.json', hadOld: true }],
+    }));
+    r = run(dir, ['readings']);
+    check(S, r.code === 1 && /restore journal/.test(r.err), `explicit unknown phase must refuse: rc=${r.code}`);
+    write(join(dir, 'restore.journal'), junkJournal);
+
+    // 无效快照:返回 1,不改动原库及旧事务材料,也不产生留存。
+    const badSnap = join(snapDir, 'bad.json');
+    write(badSnap, '{"format":"meterwatch-snapshot","version":1,"checksum":"sha256:0","payload":{}}');
+    r = run(dir, ['rescue', badSnap]);
+    check(S, r.code === 1 && /integrity check/.test(r.err), `invalid snapshot rc=${r.code}`);
+    check(S, sameSnapshot(before, storeSnapshot(dir)) === null &&
+      readFileSync(join(dir, 'restore.journal'), 'utf8') === junkJournal,
+    'invalid snapshot changed nothing');
+    check(S, !existsSync(join(dir, 'rescue-preserved-1')), 'no preservation on invalid snapshot');
+
+    // 快照位于数据目录内 / 缺参数:返回 2。
+    r = run(dir, ['rescue', join(dir, 'inside.json')]);
+    check(S, r.code === 2, `snapshot inside data dir must be rc=2, got ${r.code}`);
+    r = run(dir, ['rescue']);
+    check(S, r.code === 2, `missing snapshot arg must be rc=2, got ${r.code}`);
+
+    // 目录被其他存活进程占用:返回 1,不动其材料。
+    write(join(dir, 'meterwatch.lock'), `${process.pid}\n`);
+    r = run(dir, ['rescue', snap]);
+    check(S, r.code === 1 && /locked by another live/.test(r.err), `locked dir rc=${r.code}: ${r.err}`);
+    check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === junkJournal, 'locked: materials untouched');
+    rmSync(join(dir, 'meterwatch.lock'));
+
+    // 显式救援成功:三个存储整体等于快照,旧事务材料从活动位置移除。
+    r = run(dir, ['rescue', snap]);
+    check(S, r.code === 0 && /rescued from snapshot/.test(r.out), `rescue rc=${r.code} ${r.err}`);
+    check(S, /pre-rescue state preserved in '[^']*rescue-preserved-1'/.test(r.out),
+      `rescue reports preserved location:\n${r.out}`);
+    const restored = readJson(dir, 'readings.json');
+    check(S, restored.readings.length === 2 && restored.corrections.length === 1 &&
+      restored.corrections[0].requestId === 'REQ1',
+    'stores wholly equal snapshot (readings + correction history)');
+    check(S, !existsSync(join(dir, 'restore.journal')) &&
+      !existsSync(join(dir, 'readings.json.restore-old')) &&
+      !existsSync(join(dir, 'groups.json.restore-new')),
+    'abandoned transaction materials removed from live locations');
+
+    // 留存完整:原始字节与缺失状态,且不按坏日志里的文件名操作。
+    const p1 = join(dir, 'rescue-preserved-1');
+    check(S, readFileSync(join(p1, 'restore.journal'), 'utf8') === junkJournal, 'preserved journal bytes');
+    check(S, readFileSync(join(p1, 'readings.json.restore-old'), 'utf8') === 'junk-old',
+      'preserved .restore-old bytes');
+    check(S, readFileSync(join(p1, 'groups.json.restore-new'), 'utf8') === 'junk-new',
+      'preserved .restore-new bytes');
+    check(S, readFileSync(join(p1, 'alerts.json'), 'utf8') === 'corrupt-business',
+      'preserved corrupt business bytes');
+    check(S, !existsSync(join(p1, 'alerts.json.restore-old')), 'missing-state preserved as absence');
+    const manifest = JSON.parse(readFileSync(join(p1, 'rescue-manifest.json'), 'utf8'));
+    check(S, manifest.preserved.length === 10 &&
+      manifest.preserved.find((e) => e.name === 'alerts.json.restore-old').hadOld === false &&
+      manifest.preserved.find((e) => e.name === 'restore.journal').hadOld === true,
+    'manifest records raw missing-state for the fixed name set');
+
+    // 业务可用:精确读数、修正重放返回原成功结果、规则与分组历史可用。
+    r = run(dir, ['readings']);
+    check(S, r.code === 0 && /3\.000/.test(r.out), `readings usable after rescue:\n${r.out}`);
+    r = run(dir, ['correct', '--request', 'REQ1',
+      '--item', '--device', 'm', '--at', '2026-01-06T00:00:00Z', '--expect', '2.000', '--set', '3.000']);
+    check(S, r.code === 0 && /committed: 1 item\(s\), 1 reading\(s\) changed/.test(r.out),
+      `correction replay returns the original recorded result:\n${r.out}`);
+    r = run(dir, ['rule', 'list']);
+    check(S, r.code === 0 && /\bnr\b/.test(r.out), `rules usable after rescue:\n${r.out}`);
+    r = run(dir, ['group', 'history', '--id', 'g']);
+    check(S, r.code === 0 && /g/.test(r.out), `group history usable after rescue:\n${r.out}`);
+
+    // 留存材料不被启动或后续命令自动清理。
+    check(S, existsSync(p1) && existsSync(join(p1, 'restore.journal')),
+      'preserved materials are not auto-cleaned by later commands');
+
+    // 重复救援(业务文件缺失 + 日志再次损坏):序号递增,不丢材料、不改写历史。
+    rmSync(join(dir, 'groups.json'));
+    write(join(dir, 'restore.journal'), 'garbage-again');
+    r = run(dir, ['rescue', snap]);
+    check(S, r.code === 0, `second rescue rc=${r.code} ${r.err}`);
+    check(S, existsSync(join(dir, 'rescue-preserved-2')) && existsSync(join(p1, 'restore.journal')),
+      'repeated rescue keeps earlier materials');
+    check(S, !existsSync(join(dir, 'rescue-preserved-2', 'groups.json')),
+      'second preservation records the missing business file');
+    r = run(dir, ['group', 'history', '--id', 'g']);
+    check(S, r.code === 0, `business usable after second rescue:\n${r.out}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(snapDir, { recursive: true, force: true });
+  }
+}
+
+// R2:救援在留存/替换/回退中被中断后,任一命令启动先续接为完整快照或完整退回
+// 救援前状态,不开放混合库;确定回退后不得改向,退回后普通命令继续拒绝。
+function scenarioRescueInterrupted() {
+  const S = 'R2 interrupted rescue continuation (preserving/committing/rolling-back)';
+  const mkJournal = (phase, preservedDir, preserved) => JSON.stringify({
+    format: 'meterwatch-rescue-journal', version: 1, phase, preservedDir,
+    stores: ['readings.json', 'alerts.json', 'groups.json'], preserved,
+  }, null, 2) + '\n';
+  const fixedRecord = (d) => {
+    const names = [];
+    for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
+      names.push(n, `${n}.restore-old`, `${n}.restore-new`);
+    }
+    names.push('restore.journal');
+    return names.map((name) => ({ name, hadOld: existsSync(join(d, name)) }));
+  };
+
+  // (a) preserving 阶段中断:替换尚未开始,退回救援前状态,业务文件不变。
+  const dirA = makeDataDir();
+  try {
+    write(join(dirA, 'r.csv'), 'device,time,reading\na,2026-01-05T00:00:00Z,1.000\n');
+    let r = run(dirA, ['import', 'r.csv']);
+    check(S, r.code === 0, `A import rc=${r.code} ${r.err}`);
+    const before = storeSnapshot(dirA);
+    write(join(dirA, 'readings.json.rescue-new'), 'junk-new');
+    write(join(dirA, 'alerts.json.rescue-new'), 'junk-new');
+    write(join(dirA, 'groups.json.rescue-new'), 'junk-new');
+    mkdirSync(join(dirA, 'rescue-preserved-1')); // 部分留存(中断)
+    write(join(dirA, 'rescue.journal'), mkJournal('preserving', 'rescue-preserved-1', fixedRecord(dirA)));
+    r = run(dirA, ['readings']);
+    check(S, r.code === 0 && /device: a/.test(r.out),
+      `A: preserving interruption must roll back to pre-rescue state: rc=${r.code} ${r.err}`);
+    check(S, sameSnapshot(before, storeSnapshot(dirA)) === null, 'A: business files untouched');
+    check(S, !existsSync(join(dirA, 'rescue.journal')) && !existsSync(join(dirA, 'readings.json.rescue-new')),
+      'A: rescue temps and journal cleaned');
+    check(S, existsSync(join(dirA, 'rescue-preserved-1')), 'A: preserved dir is not auto-cleaned');
+  } finally {
+    rmSync(dirA, { recursive: true, force: true });
+  }
+
+  // (b) committing 阶段中断:只能前滚为完整快照,旧事务材料随收尾移除。
+  const dirB = makeDataDir();
+  const dirC = makeDataDir();
+  try {
+    write(join(dirB, 'r.csv'), 'device,time,reading\nm2,2026-01-05T00:00:00Z,5.000\n');
+    let r = run(dirB, ['import', 'r.csv']);
+    check(S, r.code === 0, `B import rc=${r.code} ${r.err}`);
+    r = run(dirB, ['rule', 'create', '--id', 'd1', '--device', 'm2', '--threshold', '1']);
+    check(S, r.code === 0, `B rule rc=${r.code} ${r.err}`);
+    r = run(dirB, ['group', 'configure', '--id', 'gb', '--at', '2026-01-01T00:00:00Z', '--device', 'm2']);
+    check(S, r.code === 0, `B group rc=${r.code} ${r.err}`);
+    write(join(dirC, 'r.csv'), 'device,time,reading\nx,2026-01-05T00:00:00Z,1.000\n');
+    r = run(dirC, ['import', 'r.csv']);
+    check(S, r.code === 0, `C import rc=${r.code} ${r.err}`);
+    // 损坏旧事务材料 + 提交中途的现场:新内容已在 *.rescue-new。
+    write(join(dirC, 'restore.journal'), 'corrupt');
+    write(join(dirC, 'readings.json.restore-old'), 'junk');
+    for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
+      copyFileSync(join(dirB, n), join(dirC, `${n}.rescue-new`));
+    }
+    mkdirSync(join(dirC, 'rescue-preserved-1'));
+    write(join(dirC, 'rescue.journal'), mkJournal('committing', 'rescue-preserved-1', fixedRecord(dirC)));
+    r = run(dirC, ['readings']);
+    check(S, r.code === 0 && /device: m2/.test(r.out) && !/device: x/.test(r.out),
+      `B: interrupted commit must complete to the full snapshot:\n${r.out}\n${r.err}`);
+    check(S, !existsSync(join(dirC, 'rescue.journal')) && !existsSync(join(dirC, 'restore.journal')) &&
+      !existsSync(join(dirC, 'readings.json.restore-old')) && !existsSync(join(dirC, 'readings.json.rescue-new')),
+    'B: journals, temps and abandoned materials cleaned after commit');
+    check(S, existsSync(join(dirC, 'rescue-preserved-1')), 'B: preserved dir kept');
+    r = run(dirC, ['rule', 'list']);
+    check(S, r.code === 0 && /\bd1\b/.test(r.out), `B: rules from snapshot usable:\n${r.out}`);
+  } finally {
+    rmSync(dirB, { recursive: true, force: true });
+    rmSync(dirC, { recursive: true, force: true });
+  }
+
+  // (c) rolling-back 阶段中断:只能继续还原救援前状态;原损坏日志恢复到位后
+  // 普通命令继续拒绝,仍可显式救援。
+  const dirD = makeDataDir();
+  const snapDir = makeDataDir();
+  try {
+    write(join(dirD, 'r.csv'), 'device,time,reading\ny,2026-01-05T00:00:00Z,7.000\n');
+    let r = run(dirD, ['import', 'r.csv']);
+    check(S, r.code === 0, `D import rc=${r.code} ${r.err}`);
+    const snap = join(snapDir, 'snap.json');
+    r = run(dirD, ['backup', snap]);
+    check(S, r.code === 0, `D backup rc=${r.code} ${r.err}`);
+    const origReadings = readFileSync(join(dirD, 'readings.json'), 'utf8');
+    // 回退中途的现场:业务文件已被换入的新内容替换,旧事务材料已被移除。
+    write(join(dirD, 'readings.json'), '{"readings":[],"corrections":[],"undos":[]}\n');
+    mkdirSync(join(dirD, 'rescue-preserved-1'));
+    write(join(dirD, 'rescue-preserved-1', 'readings.json'), origReadings);
+    write(join(dirD, 'rescue-preserved-1', 'restore.journal'), 'corrupt-journal');
+    const record = [
+      { name: 'readings.json', hadOld: true },
+      { name: 'readings.json.restore-old', hadOld: false },
+      { name: 'readings.json.restore-new', hadOld: false },
+      { name: 'alerts.json', hadOld: false },
+      { name: 'alerts.json.restore-old', hadOld: false },
+      { name: 'alerts.json.restore-new', hadOld: false },
+      { name: 'groups.json', hadOld: false },
+      { name: 'groups.json.restore-old', hadOld: false },
+      { name: 'groups.json.restore-new', hadOld: false },
+      { name: 'restore.journal', hadOld: true },
+    ];
+    write(join(dirD, 'rescue.journal'), mkJournal('rolling-back', 'rescue-preserved-1', record));
+    r = run(dirD, ['readings']);
+    check(S, r.code === 1 && /restore journal/.test(r.err),
+      `C: after rollback the restored corrupt journal must keep refusing: rc=${r.code}\n${r.out}`);
+    check(S, readFileSync(join(dirD, 'readings.json'), 'utf8') === origReadings,
+      'C: pre-rescue business bytes restored');
+    check(S, readFileSync(join(dirD, 'restore.journal'), 'utf8') === 'corrupt-journal',
+      'C: corrupt journal restored in place');
+    check(S, !existsSync(join(dirD, 'rescue.journal')), 'C: rescue journal removed after rollback');
+    check(S, existsSync(join(dirD, 'rescue-preserved-1')), 'C: preserved materials kept');
+    // 显式救援仍可用,成功后业务恢复。
+    r = run(dirD, ['rescue', snap]);
+    check(S, r.code === 0, `C: explicit rescue after rollback rc=${r.code} ${r.err}`);
+    r = run(dirD, ['readings']);
+    check(S, r.code === 0 && /device: y/.test(r.out), `C: business usable after rescue:\n${r.out}`);
+  } finally {
+    rmSync(dirD, { recursive: true, force: true });
+    rmSync(snapDir, { recursive: true, force: true });
+  }
+}
+
+// R3:救援替换阶段受控失败 → 确定回退不得改向;回退受阻(文件锁定)时保留全部
+// 材料并阻止业务,故障排除后任一命令续接还原救援前状态,普通命令继续拒绝。
+function scenarioRescueFailureRollback() {
+  const S = 'R3 rescue commit failure rolls back; blocked rollback keeps materials';
+  const dir = makeDataDir();
+  const snapDir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), 'device,time,reading\nz,2026-01-05T00:00:00Z,9.000\n');
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    const snap = join(snapDir, 'snap.json');
+    r = run(dir, ['backup', snap]);
+    check(S, r.code === 0, `backup rc=${r.code} ${r.err}`);
+    const origReadings = readFileSync(join(dir, 'readings.json'), 'utf8');
+    write(join(dir, 'restore.journal'), 'corrupt-journal');
+
+    // 可控本地故障:锁定业务文件,使替换与回滚的删除都失败。
+    const readingsPath = join(dir, 'readings.json');
+    execFileSync('chflags', ['uchg', readingsPath]);
+    try {
+      r = run(dir, ['rescue', snap]);
+      check(S, r.code === 1 && /keeps all materials|keeps its rescue materials/.test(r.err),
+        `rescue with blocked rollback must fail rc=1 and keep materials: rc=${r.code} ${r.err}`);
+      // 材料全部保留:救援日志(rolling-back)、新临时、留存目录、原损坏日志。
+      const rj = readJson(dir, 'rescue.journal');
+      check(S, rj !== null && rj.phase === 'rolling-back',
+        `rescue journal must pin rolling-back (no direction change): ${JSON.stringify(rj)}`);
+      check(S, existsSync(join(dir, 'readings.json.rescue-new')), 'rescue temp kept');
+      check(S, existsSync(join(dir, 'rescue-preserved-1', 'readings.json')), 'preserved copy kept');
+      check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'corrupt-journal',
+        'old corrupt journal untouched');
+      check(S, readFileSync(readingsPath, 'utf8') === origReadings, 'business file untouched');
+      // 故障未排除时任一命令启动仍受阻,不开放混合库。
+      r = run(dir, ['readings']);
+      check(S, r.code === 1 && /cannot complete interrupted rescue/.test(r.err),
+        `startup must stay blocked while rollback is stuck: rc=${r.code}`);
+    } finally {
+      execFileSync('chflags', ['nouchg', readingsPath]);
+    }
+    // 故障排除后任一命令续接回退:还原救援前状态(含原损坏日志),普通命令继续拒绝。
+    r = run(dir, ['readings']);
+    check(S, r.code === 1 && /restore journal/.test(r.err),
+      `after rollback the restored corrupt journal keeps refusing: rc=${r.code}`);
+    check(S, readFileSync(readingsPath, 'utf8') === origReadings, 'pre-rescue business bytes restored');
+    check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'corrupt-journal',
+      'pre-rescue corrupt journal restored');
+    check(S, !existsSync(join(dir, 'rescue.journal')) && !existsSync(join(dir, 'readings.json.rescue-new')),
+      'rescue journal and temps cleaned after rollback');
+    check(S, existsSync(join(dir, 'rescue-preserved-1')), 'preserved materials survive rollback');
+    // 显式救援仍可用并成功。
+    r = run(dir, ['rescue', snap]);
+    check(S, r.code === 0, `rescue after fault cleared rc=${r.code} ${r.err}`);
+    r = run(dir, ['readings']);
+    check(S, r.code === 0 && /device: z/.test(r.out), `business usable after rescue:\n${r.out}`);
+  } finally {
+    try { execFileSync('chflags', ['nouchg', join(dir, 'readings.json')]); } catch { /* may not exist */ }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(snapDir, { recursive: true, force: true });
+  }
+}
+
 const scenarios = [
   scenarioS1,
   scenarioDst,
@@ -1025,6 +1352,9 @@ const scenarios = [
   scenarioExceptionParsing,
   scenarioExceptionPersistence,
   scenarioExceptionDst,
+  scenarioRescue,
+  scenarioRescueInterrupted,
+  scenarioRescueFailureRollback,
 ];
 
 for (const sc of scenarios) {
