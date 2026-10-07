@@ -14,20 +14,21 @@
 // 目标类型、同目标标识、等价阈值、同时区及同间隔限制重试成功且不重复创建,
 // 任一不同即报冲突。
 //
-// 分组规则另可在创建时用 --schedule 指定本地每周运行时间表(格式与
-// group schedule-report 相同),成为非运行时段告警规则;省略为全天模式,
-// 设备规则不接受时间表。创建时把解析后的时间表规范形(每周运行窗口并集)
-// 保存在规则内,原文件后续修改、移动或删除不影响规则;时间表与目标、阈值、
-// 时区、采样限制一样创建后固定。同标识重试比较模式及每周运行窗口并集
-// (不比较文件路径;窗口顺序、重复及等价拆分不影响等价性),其余参数沿用
-// 原比较规则,任一不同即报冲突。非运行模式每天只取该日期全部实际时段中的
-// 非运行部分参与判定:非运行时段全部有效才比较合计消耗(运行时段的异常或
-// 未知不阻止判定),严格超阈值才触发,零增长有效;非运行部分有异常或未知
-// 则不可判定,不触发也不恢复;没有非运行秒数的日期说明原因,不判定、不
-// 触发也不恢复。评估与历史显示非运行 UTC 时段、当前消耗与有效/异常/未知
-// (及过长间隔未知)秒数,覆盖合计等于当天非运行时长;触发与恢复记录的
-// 消耗为非运行值。列表显示模式及固定时间表;旧规则与旧快照按全天模式,
-// 非法已存模式或时间表按损坏数据拒绝。
+// 分组规则另可在创建时用 --schedule 指定本地运行时间表(每周窗口 + 日期例外,
+// 格式与 group schedule-report 相同),成为非运行时段告警规则;省略为全天模式,
+// 设备规则不接受时间表。创建时把解析后的时间表规范形(每周运行窗口并集 + 例外
+// 日期映射及各日窗口并集)保存在规则内,原文件后续修改、移动或删除不影响规则;
+// 时间表与目标、阈值、时区、采样限制一样创建后固定。同标识重试比较模式、每周
+// 运行窗口并集与例外日期映射(不比较文件路径;窗口顺序、重复及等价拆分不影响
+// 等价性;明确全天停运与没有例外不同),其余参数沿用原比较规则,任一不同即报
+// 冲突。非运行模式每天只取该日期全部实际时段中的非运行部分参与判定:非运行
+// 时段全部有效才比较合计消耗(运行时段的异常或未知不阻止判定),严格超阈值才
+// 触发,零增长有效;非运行部分有异常或未知则不可判定,不触发也不恢复;没有
+// 非运行秒数的日期说明原因,不判定、不触发也不恢复。评估与历史显示非运行 UTC
+// 时段、当前消耗与有效/异常/未知(及过长间隔未知)秒数与所用例外,覆盖合计
+// 等于当天非运行时长;触发与恢复记录的消耗为非运行值。列表显示模式及固定时间
+// 表(含例外日期及窗口或全天停运);旧规则与旧快照按全天模式、无例外使用,
+// 非法已存模式、时间表或例外按损坏数据拒绝。
 //
 // - 评估针对连续完整的当地日期(起日含、止日不含)。每个日期统计归属该日期的
 //   全部实际 UTC 时段,不把当地午夜套用固定偏移:夏令时短日不补未知,回拨
@@ -65,11 +66,15 @@ import {
 import { computeDay, DAY_SECONDS, formatGapLine, maxIntervalText, mergeGaps, type DayStats, type GapDetail } from './report.ts';
 import { computeGroupSegment, loadCheckedSeriesByDevice, loadGroups, type Group } from './groups.ts';
 import {
+  canonicalizeExceptions,
   canonicalizeWindows,
   classifyPeriods,
+  formatException,
   formatSchedule,
+  validateStoredExceptions,
   validateStoredSchedule,
-  type ScheduleWindow,
+  type Schedule,
+  type ScheduleException,
 } from './schedule.ts';
 import { formatIsoUtc, parseUtcDate } from './time.ts';
 import { canonicalTimezone, loadTimezone, localDateRange, type LocalDay, type LocalDayPeriod } from './tz.ts';
@@ -90,10 +95,10 @@ export interface AlertRule {
   tz: string;
   /** 最大采样间隔限制(正整数秒);省略表示无上限。创建后固定。 */
   maxInterval?: number;
-  /** 非运行模式的固定每周运行时间表(规范形:并集合并后的窗口,按周分钟
-   *  升序);省略表示全天模式。仅分组规则可带,创建时保存解析结果,与原
-   *  时间表文件后续变化无关;创建后固定。 */
-  schedule?: ScheduleWindow[];
+  /** 非运行模式的固定时间表(每周窗口并集 + 日期例外,均为规范形);省略表示
+   *  全天模式。仅分组规则可带,创建时保存解析结果,与原时间表文件后续变化
+   *  无关;创建后固定。 */
+  schedule?: Schedule;
 }
 
 export type AlertEventType = 'triggered' | 'recovered' | 'acknowledged';
@@ -151,18 +156,35 @@ function modeText(rule: Pick<AlertRule, 'schedule'>): string {
 }
 
 /**
- * 每周运行窗口并集等价性:两边都取规范形后逐窗口比较。窗口顺序、重复及
- * 等价拆分不影响等价性;不比较任何文件路径。两边都省略(全天模式)才相等。
+ * 时间表等价性:两边每周窗口与日期例外都取规范形后比较——每周运行窗口并集
+ * 相同,且例外日期映射相同、各日窗口并集相同。窗口顺序、重复及等价拆分不
+ * 影响等价性;不比较任何文件路径;明确全天停运(空窗口数组)与没有例外不同。
+ * 两边都省略(全天模式)才相等。
  */
-function scheduleEquals(a?: ScheduleWindow[], b?: ScheduleWindow[]): boolean {
+function scheduleEquals(a?: Schedule, b?: Schedule): boolean {
   if (a === undefined || b === undefined) return a === b;
-  const ca = canonicalizeWindows(a);
-  const cb = canonicalizeWindows(b);
-  return (
-    ca.length === cb.length &&
-    ca.every(
+  const ca = canonicalizeWindows(a.windows);
+  const cb = canonicalizeWindows(b.windows);
+  if (
+    ca.length !== cb.length ||
+    !ca.every(
       (w, i) =>
         w.startDow === cb[i].startDow && w.startMin === cb[i].startMin && w.endMin === cb[i].endMin,
+    )
+  ) {
+    return false;
+  }
+  const ea = canonicalizeExceptions(a.exceptions);
+  const eb = canonicalizeExceptions(b.exceptions);
+  return (
+    ea.length === eb.length &&
+    ea.every(
+      (e, i) =>
+        e.date === eb[i].date &&
+        e.windows.length === eb[i].windows.length &&
+        e.windows.every(
+          (w, j) => w.startMin === eb[i].windows[j].startMin && w.endMin === eb[i].windows[j].endMin,
+        ),
     )
   );
 }
@@ -238,20 +260,23 @@ export function parseAlertState(data: unknown, source: string): AlertState {
       }
       maxInterval = r.maxInterval as number;
     }
-    // 模式与时间表:新版字段 mode/schedule;旧版无该字段的规则按全天模式
-    // 使用。非法已存模式或时间表按损坏数据拒绝;非运行模式只适用于分组
-    // 规则,全天模式不得带时间表。
+    // 模式与时间表:新版字段 mode/schedule/exceptions;旧版无该字段的规则按
+    // 全天模式使用,无 exceptions 字段的非运行规则按无例外使用。非法已存模式、
+    // 时间表或例外按损坏数据拒绝;非运行模式只适用于分组规则,全天模式不得带
+    // 时间表或例外。
     const mode = r.mode === undefined ? 'all-day' : r.mode;
     if (mode !== 'all-day' && mode !== 'non-running') {
       throw bad(`invalid mode in rule '${r.id}'`);
     }
-    let schedule: ScheduleWindow[] | undefined;
+    let schedule: Schedule | undefined;
     if (mode === 'non-running') {
       if (targetType !== 'group') throw bad(`non-running mode on device rule '${r.id}'`);
       const parsed = validateStoredSchedule(r.schedule);
       if (parsed === null) throw bad(`invalid schedule in rule '${r.id}'`);
-      schedule = parsed;
-    } else if (r.schedule !== undefined) {
+      const exceptions = validateStoredExceptions(r.exceptions);
+      if (exceptions === null) throw bad(`invalid exceptions in rule '${r.id}'`);
+      schedule = { windows: parsed, exceptions };
+    } else if (r.schedule !== undefined || r.exceptions !== undefined) {
       throw bad(`unexpected schedule in all-day rule '${r.id}'`);
     }
     if (ruleIds.has(r.id)) throw bad(`duplicate rule id '${r.id}'`);
@@ -339,7 +364,13 @@ export function serializeAlertState(state: AlertState): Record<string, unknown> 
       thresholdMilli: r.thresholdMilli.toString(),
       tz: r.tz,
       ...(r.maxInterval !== undefined ? { maxInterval: r.maxInterval } : {}),
-      ...(r.schedule !== undefined ? { mode: 'non-running', schedule: r.schedule } : {}),
+      ...(r.schedule !== undefined
+        ? {
+            mode: 'non-running',
+            schedule: r.schedule.windows,
+            ...(r.schedule.exceptions.length > 0 ? { exceptions: r.schedule.exceptions } : {}),
+          }
+        : {}),
     })),
   };
 }
@@ -453,10 +484,10 @@ function ruleFormat(rule: AlertRule): Intl.DateTimeFormat {
 
 /**
  * 规则在一个当地日期上实际参与判定的 UTC 时段:全天模式为该日期的全部
- * 实际时段;非运行模式为这些时段按规则固定的每周运行时间表分类后的非
- * 运行部分(分类沿用 group schedule-report 的口径:按实际时刻的当地日期
- * 与墙钟,回拨重复小时各自分类,跳过时段不虚构)。同一日期的不连续时段
- * 分别分类后合并在同一日期下参与一次判定。
+ * 实际时段;非运行模式为这些时段按规则固定的时间表(每周窗口 + 日期例外)
+ * 分类后的非运行部分(分类沿用 group schedule-report 的口径:按实际时刻的
+ * 当地日期与墙钟,回拨重复小时各自分类,跳过时段不虚构;例外替换该日全部
+ * 运行集合)。同一日期的不连续时段分别分类后合并在同一日期下参与一次判定。
  */
 function ruleDayPeriods(rule: AlertRule, fmt: Intl.DateTimeFormat, day: LocalDay): LocalDayPeriod[] {
   if (rule.schedule === undefined) return day.periods;
@@ -465,6 +496,19 @@ function ruleDayPeriods(rule: AlertRule, fmt: Intl.DateTimeFormat, day: LocalDay
     out.push(...classifyPeriods(fmt, p.start, p.end, rule.schedule).nonRunning);
   }
   return out;
+}
+
+/** 规则时间表中适用于给定当地日期的例外;全天模式或无该日期例外返回 undefined。 */
+function ruleException(rule: AlertRule, label: string): ScheduleException | undefined {
+  return rule.schedule?.exceptions.find((e) => e.date === label);
+}
+
+/** 一天所用例外的展示行(无例外为空)。 */
+function exceptionLines(rule: AlertRule, label: string): string[] {
+  const exc = ruleException(rule, label);
+  return exc === undefined
+    ? []
+    : [`    exception=${formatException(exc)} (replaces weekly schedule for this date)`];
 }
 
 /**
@@ -504,10 +548,11 @@ function computeRuleDay(env: RuleEnv, periods: LocalDayPeriod[], maxInterval?: n
 
 /**
  * 创建规则。相同标识、同目标类型、同目标标识、等价阈值、同时区(规范名)、
- * 同采样间隔限制及同模式(非运行模式比较每周运行窗口并集,不比较文件路径)
- * 重试成功且不重复创建;任一不同即报冲突。设备必须已有存储读数;分组必须
- * 已配置。非运行模式(带固定时间表,仅分组规则)的创建与同参重试都先检查
- * 所用存储与全库重复读数身份。返回进程退出码。
+ * 同采样间隔限制及同模式(非运行模式比较每周运行窗口并集与例外日期映射,
+ * 不比较文件路径;明确全天停运与没有例外不同)重试成功且不重复创建;任一
+ * 不同即报冲突。设备必须已有存储读数;分组必须已配置。非运行模式(带固定
+ * 时间表,仅分组规则)的创建与同参重试都先检查所用存储与全库重复读数身份。
+ * 返回进程退出码。
  */
 export function cmdRuleCreate(opts: {
   id: string;
@@ -518,9 +563,9 @@ export function cmdRuleCreate(opts: {
   tz: string;
   /** 最大采样间隔限制(正整数秒);省略表示无上限,创建后固定。 */
   maxInterval?: number;
-  /** 非运行模式的每周运行时间表(已解析并规范化的窗口并集);省略为全天
+  /** 非运行模式的时间表(每周窗口与日期例外,均已解析并规范化);省略为全天
    *  模式。仅分组规则可带;创建时保存解析结果,与原文件后续变化无关。 */
-  schedule?: ScheduleWindow[];
+  schedule?: Schedule;
 }): number {
   const statePath = alertFilePath();
   let state: AlertState;
@@ -701,13 +746,18 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
     }
     // 全天模式为当天全部实际时段;非运行模式只取其中的非运行部分。
     const periods = ruleDayPeriods(rule, fmt, day);
+    const excLines = exceptionLines(rule, label);
     let periodSeconds = 0;
     for (const p of periods) periodSeconds += p.end - p.start;
     if (periodSeconds === 0) {
       // 非运行模式且当天没有非运行秒数:说明原因,不判定、不触发也不恢复。
-      lines.push(
-        `  ${label}  NO NON-RUNNING COVERAGE (running windows cover the whole local date)  no alert action`,
-      );
+      const exc = ruleException(rule, label);
+      const reason =
+        exc === undefined
+          ? 'running windows cover the whole local date'
+          : `exception ${formatException(exc)} covers the whole local date`;
+      lines.push(`  ${label}  NO NON-RUNNING COVERAGE (${reason})  no alert action`);
+      lines.push(...excLines);
       continue;
     }
     const stats = computeRuleDay(env, periods, rule.maxInterval);
@@ -721,6 +771,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
           : `  ${label}  undecidable (${coverage})  no alert action`;
       lines.push(head);
       lines.push(...periodLines(periods));
+      lines.push(...excLines);
       lines.push(...gapLines(stats, rule));
       continue;
     }
@@ -766,6 +817,7 @@ export function cmdEvaluate(opts: { ruleId: string; from: string; to: string }):
       }
     }
     lines.push(...periodLines(periods));
+    lines.push(...excLines);
   }
 
   try {
@@ -854,7 +906,12 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
       let periodSeconds = 0;
       for (const p of periods) periodSeconds += p.end - p.start;
       if (periodSeconds === 0) {
-        console.log(`  ${label}  NO NON-RUNNING COVERAGE (running windows cover the whole local date)`);
+        const exc = ruleException(rule, label);
+        const reason =
+          exc === undefined
+            ? 'running windows cover the whole local date'
+            : `exception ${formatException(exc)} covers the whole local date`;
+        console.log(`  ${label}  NO NON-RUNNING COVERAGE (${reason})`);
       } else {
         const stats = computeRuleDay(env, periods, rule.maxInterval);
         if (stats.unknown > 0 || stats.anomaly > 0) {
@@ -872,6 +929,7 @@ export function cmdAlerts(opts: { ruleId: string; from?: string; to?: string }):
           );
         }
         for (const line of periodLines(periods)) console.log(line);
+        for (const line of exceptionLines(rule, label)) console.log(line);
         for (const line of gapLines(stats, rule)) console.log(line);
       }
     }
