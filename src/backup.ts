@@ -23,6 +23,15 @@
 //   写入。操作权是按数据目录隔离的排他锁:同目录被其他存活进程占用时明确
 //   拒绝返回 1,不读写业务存储、不清理对方事务材料;属主退出后可安全接管,
 //   不同数据目录互不阻塞。备份、恢复与启动自恢复期间同样持锁。
+// - 恢复日志无法解析或含显式未知阶段时,普通命令(含 restore)一律返回 1:
+//   保留业务文件与恢复材料,不输出正常结果、不猜测前滚方向。此时唯一出路是
+//   显式快照救援(rescue):救援不解析当前库与旧日志,先按与 restore 相同的
+//   规则校验快照,再把救援前的三个业务文件、restore.journal 及对应
+//   *.restore-old/*.restore-new 的原始字节与缺失状态完整留存到数据目录下的
+//   rescue-preserve-*/(留存不完整绝不替换),然后放弃旧事务、把三个业务存储
+//   整体替换为快照内容。留存材料不被启动或后续恢复自动清理。救援自身用
+//   rescue.journal 记录阶段:被中断后任一命令启动先续接为完整快照或完整退回
+//   救援前状态,不开放混合库;已进入回退不得改向。
 
 import { createHash } from 'node:crypto';
 import {
@@ -67,6 +76,13 @@ const JOURNAL_NAME = 'restore.journal';
 const JOURNAL_FORMAT = 'meterwatch-restore-journal';
 const NEW_SUFFIX = '.restore-new';
 const OLD_SUFFIX = '.restore-old';
+
+// 显式快照救援(rescue):救援事务日志、留存清单与还原临时文件。
+const RESCUE_JOURNAL_NAME = 'rescue.journal';
+const RESCUE_JOURNAL_FORMAT = 'meterwatch-rescue-journal';
+const PRESERVE_FORMAT = 'meterwatch-rescue-preserve';
+const PRESERVE_DIR_PREFIX = 'rescue-preserve-';
+const RESCUE_TMP_MARK = '.rescue-tmp-';
 
 /** 恢复阶段;阶段只能按声明的顺序推进,字段缺失按最保守的 committing 处理。 */
 type RestorePhase = 'preparing' | 'committing' | 'rolling-back' | 'done';
@@ -264,10 +280,15 @@ function parseJournal(data: unknown): Journal | null {
   ) {
     return null;
   }
-  // 旧/缺阶段字段按最保守的 committing 处理(只能前滚)。
+  // 缺失阶段字段(旧日志)按最保守的 committing 处理(只能前滚);显式写出
+  // 却无法识别的阶段视为无效日志:无法可靠判定,绝不猜测前滚方向。
   let phase: RestorePhase = 'committing';
-  if (typeof o.phase === 'string' && (PHASES as string[]).includes(o.phase)) {
-    phase = o.phase as RestorePhase;
+  if (o.phase !== undefined) {
+    if (typeof o.phase === 'string' && (PHASES as string[]).includes(o.phase)) {
+      phase = o.phase as RestorePhase;
+    } else {
+      return null;
+    }
   }
   const names = new Set<string>();
   const files: JournalFile[] = [];
@@ -462,6 +483,332 @@ function rollForwardCleanup(dir: string, journal: Journal): void {
 }
 
 // ---------------------------------------------------------------------------
+// 显式快照救援(rescue):放弃无法可靠续接的旧事务,整体替换为完好快照
+// ---------------------------------------------------------------------------
+
+/**
+ * 救援阶段。救援日志只在留存完成、替换开始前才原子创建,故无 preparing
+ * 阶段:留存期间被中断时日志尚不存在,业务文件与旧事务材料未被触碰,
+ * 不完整的留存目录只是无害残留(不被自动清理,也不影响后续救援)。
+ */
+type RescuePhase = 'committing' | 'rolling-back' | 'done';
+const RESCUE_PHASES: RescuePhase[] = ['committing', 'rolling-back', 'done'];
+
+interface RescueJournal {
+  phase: RescuePhase;
+  /** 留存目录名(basename,位于数据目录内)。 */
+  preserveDir: string;
+}
+
+interface PreserveEntry {
+  /** 固定文件名(basename)。 */
+  name: string;
+  /** 救援前该文件是否存在。 */
+  present: boolean;
+}
+
+/** 三个业务存储文件名(basename,顺序固定)。 */
+function storeNames(): string[] {
+  return storeFiles().map((p) => basename(p));
+}
+
+/**
+ * 救援前必须留存的固定文件名:三个业务存储、对应的 *.restore-old /
+ * *.restore-new 旧事务材料,以及 restore.journal。一律按固定名操作,
+ * 绝不采用(可能已损坏的)日志里记录的文件名。
+ */
+function preservedNames(): string[] {
+  const names: string[] = [];
+  for (const n of storeNames()) {
+    names.push(n, n + OLD_SUFFIX, n + NEW_SUFFIX);
+  }
+  names.push(JOURNAL_NAME);
+  return names;
+}
+
+/**
+ * 解析救援日志。结构非法或阶段无法识别返回 null:调用方按无法可靠判定
+ * 处理,保留全部材料,绝不猜测。
+ */
+function parseRescueJournal(data: unknown): RescueJournal | null {
+  const o = data as Record<string, unknown>;
+  if (
+    o === null ||
+    typeof o !== 'object' ||
+    o.format !== RESCUE_JOURNAL_FORMAT ||
+    o.version !== 1 ||
+    typeof o.preserveDir !== 'string' ||
+    o.preserveDir.length === 0 ||
+    basename(o.preserveDir as string) !== o.preserveDir ||
+    typeof o.phase !== 'string' ||
+    !(RESCUE_PHASES as string[]).includes(o.phase)
+  ) {
+    return null;
+  }
+  return { phase: o.phase as RescuePhase, preserveDir: o.preserveDir as string };
+}
+
+/** 原子改写救援日志(先写临时文件再换名)。失败抛错,材料保留。 */
+function writeRescueJournal(dir: string, journal: RescueJournal, phase: RescuePhase): void {
+  const journalPath = join(dir, RESCUE_JOURNAL_NAME);
+  const tmp = `${journalPath}.tmp-${process.pid}`;
+  writeFileSync(
+    tmp,
+    JSON.stringify(
+      { format: RESCUE_JOURNAL_FORMAT, version: 1, phase, preserveDir: journal.preserveDir },
+      null,
+      2,
+    ) + '\n',
+    'utf8',
+  );
+  renameSync(tmp, journalPath);
+  journal.phase = phase;
+}
+
+/** 生成数据目录内唯一的留存目录名(时间戳 + 进程号,冲突时追加序号)。 */
+function uniquePreserveDirName(dir: string): string {
+  const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, '');
+  for (let i = 0; ; i++) {
+    const name = `${PRESERVE_DIR_PREFIX}${stamp}-${process.pid}${i === 0 ? '' : `-${i}`}`;
+    if (!existsSync(join(dir, name))) return name;
+  }
+}
+
+/**
+ * 留存救援前状态:把固定名清单中每个存在的文件按原始字节复制到
+ * 留存目录 pre/ 下,缺失状态记入清单;快照新内容写入 incoming/。
+ * 清单最后写:只有完整清单才表示留存完整,留存不完整绝不开始替换。
+ * 失败抛错;业务文件与旧事务材料此阶段未被触碰。
+ */
+function writePreservation(
+  dir: string,
+  preserveDir: string,
+  incoming: Array<{ name: string; body: string }>,
+): void {
+  const pdir = join(dir, preserveDir);
+  mkdirSync(pdir);
+  mkdirSync(join(pdir, 'pre'));
+  mkdirSync(join(pdir, 'incoming'));
+  for (const f of incoming) {
+    writeFileSync(join(pdir, 'incoming', f.name), f.body, 'utf8');
+  }
+  const entries: PreserveEntry[] = [];
+  for (const name of preservedNames()) {
+    const src = join(dir, name);
+    if (existsSync(src)) {
+      if (!isRegularFile(src)) {
+        throw new StoreError(`cannot preserve ${src}: not a regular file`);
+      }
+      writeFileSync(join(pdir, 'pre', name), readFileSync(src));
+      entries.push({ name, present: true });
+    } else {
+      entries.push({ name, present: false });
+    }
+  }
+  writeFileSync(
+    join(pdir, 'manifest.json'),
+    JSON.stringify({ format: PRESERVE_FORMAT, version: 1, entries }, null, 2) + '\n',
+    'utf8',
+  );
+}
+
+/**
+ * 读取留存清单;缺失、损坏或与固定名清单不符时抛错(无法可靠续接,
+ * 保留全部材料,不猜测)。
+ */
+function readManifest(pdir: string): PreserveEntry[] {
+  const manifestPath = join(pdir, 'manifest.json');
+  let data: unknown;
+  try {
+    data = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch (e) {
+    throw new StoreError(`preserve manifest ${manifestPath} is unreadable: ${(e as Error).message}`);
+  }
+  const o = data as Record<string, unknown>;
+  if (
+    o === null ||
+    typeof o !== 'object' ||
+    o.format !== PRESERVE_FORMAT ||
+    o.version !== 1 ||
+    !Array.isArray(o.entries)
+  ) {
+    throw new StoreError(`preserve manifest ${manifestPath} is invalid`);
+  }
+  const expected = preservedNames();
+  const seen = new Set<string>();
+  const entries: PreserveEntry[] = [];
+  for (const e of o.entries as Array<Record<string, unknown>>) {
+    if (
+      e === null ||
+      typeof e !== 'object' ||
+      typeof e.name !== 'string' ||
+      typeof e.present !== 'boolean' ||
+      !expected.includes(e.name as string) ||
+      seen.has(e.name as string)
+    ) {
+      throw new StoreError(`preserve manifest ${manifestPath} is invalid`);
+    }
+    seen.add(e.name as string);
+    entries.push({ name: e.name as string, present: e.present as boolean });
+  }
+  if (entries.length !== expected.length) {
+    throw new StoreError(`preserve manifest ${manifestPath} is incomplete`);
+  }
+  return entries;
+}
+
+/**
+ * 救援前滚为完整快照,逐文件幂等,可在任意一步中断后续接:
+ * 先删除已被留存的旧事务材料(restore.journal 与 *.restore-old /
+ * *.restore-new),再把 incoming/ 中的快照内容逐个换入业务文件。
+ * incoming 文件还在说明该文件尚未换入;不在则原位必须已是常规文件。
+ */
+function rescueRollForward(dir: string, journal: RescueJournal): void {
+  const pdir = join(dir, journal.preserveDir);
+  // 进入 committing 前清单必已写妥;读不出即无法可靠续接,中止而不猜。
+  readManifest(pdir);
+  // 放弃旧事务材料(原始字节已留存在 pre/ 下)。
+  const abandoned = [JOURNAL_NAME];
+  for (const n of storeNames()) {
+    abandoned.push(n + OLD_SUFFIX, n + NEW_SUFFIX);
+  }
+  for (const name of abandoned) {
+    const p = join(dir, name);
+    if (existsSync(p)) {
+      if (!isRegularFile(p)) {
+        throw new StoreError(`cannot abandon old restore material ${p}: not a regular file`);
+      }
+      rmSync(p);
+    }
+  }
+  // 换入快照内容。
+  for (const name of storeNames()) {
+    const inc = join(pdir, 'incoming', name);
+    const target = join(dir, name);
+    if (existsSync(inc)) {
+      if (!isRegularFile(inc)) {
+        throw new StoreError(`staged snapshot content ${inc} is not a regular file`);
+      }
+      if (existsSync(target)) {
+        if (!isRegularFile(target)) {
+          throw new StoreError(`cannot commit ${target}: target exists but is not a regular file`);
+        }
+        rmSync(target);
+      }
+      renameSync(inc, target);
+    } else if (!isRegularFile(target)) {
+      throw new StoreError(
+        `cannot determine state of ${target}: neither the store nor its staged content exists`,
+      );
+    }
+  }
+}
+
+/** 救援前滚收尾:incoming 应已全部换入,删除救援日志;留存目录永久保留。 */
+function rescueRollForwardCleanup(dir: string, journal: RescueJournal): void {
+  const pdir = join(dir, journal.preserveDir);
+  for (const name of storeNames()) {
+    const inc = join(pdir, 'incoming', name);
+    if (existsSync(inc)) {
+      throw new StoreError(`staged snapshot content ${inc} still present; commit is incomplete`);
+    }
+  }
+  rmSync(join(dir, RESCUE_JOURNAL_NAME));
+}
+
+/**
+ * 救援回退:按清单把救援前业务文件与旧事务材料的内容与存在状态完整还原
+ * (从 pre/ 复制原始字节,不消耗留存;原本缺失的恢复为缺失)。幂等,可在
+ * 任意一步中断后续接;进入回退后不得改向前滚。
+ */
+function rescueRollback(dir: string, journal: RescueJournal): void {
+  const pdir = join(dir, journal.preserveDir);
+  const entries = readManifest(pdir);
+  for (const entry of entries) {
+    const target = join(dir, entry.name);
+    if (entry.present) {
+      const pre = join(pdir, 'pre', entry.name);
+      if (!isRegularFile(pre)) {
+        throw new StoreError(`preserved copy ${pre} is missing or not a regular file`);
+      }
+      if (existsSync(target) && !isRegularFile(target)) {
+        throw new StoreError(`cannot restore ${target}: target exists but is not a regular file`);
+      }
+      const tmp = `${target}${RESCUE_TMP_MARK}${process.pid}`;
+      writeFileSync(tmp, readFileSync(pre));
+      if (existsSync(target)) rmSync(target);
+      renameSync(tmp, target);
+    } else if (existsSync(target)) {
+      if (!isRegularFile(target)) {
+        throw new StoreError(`cannot restore missing state for ${target}: not a regular file`);
+      }
+      rmSync(target);
+    }
+  }
+}
+
+/** 救援回退收尾:清理还原临时文件,删除救援日志;留存目录永久保留。 */
+function rescueRollbackCleanup(dir: string, journal: RescueJournal): void {
+  for (const entry of readdirSync(dir)) {
+    if (entry.includes(RESCUE_TMP_MARK)) {
+      rmSync(join(dir, entry), { recursive: true, force: true });
+    }
+  }
+  rmSync(join(dir, RESCUE_JOURNAL_NAME));
+}
+
+/**
+ * 续接被中断的救援(持锁调用):
+ * - committing:优先前滚为完整快照;前滚受阻则完整退回救援前状态
+ *   (救援前状态已完整留存,回退总是可行;确定回退后不得改向)。
+ * - rolling-back:只能继续还原救援前状态。
+ * - done:完成前滚收尾。
+ * 成功返回 null;无法可靠判定或完成时返回错误消息,材料一律保留。
+ */
+function resumeRescue(dir: string, journal: RescueJournal): string | null {
+  const kept =
+    `rescue materials were kept (${RESCUE_JOURNAL_NAME} and ${journal.preserveDir}/); ` +
+    `do not delete them, resolve the underlying read/write problem and run any meterwatch command again`;
+  if (journal.phase === 'committing') {
+    try {
+      rescueRollForward(dir, journal);
+      writeRescueJournal(dir, journal, 'done');
+      rescueRollForwardCleanup(dir, journal);
+      err('completed an interrupted rescue: snapshot state committed');
+      return null;
+    } catch (e) {
+      try {
+        writeRescueJournal(dir, journal, 'rolling-back');
+        rescueRollback(dir, journal);
+        rescueRollbackCleanup(dir, journal);
+        err('rolled back an interrupted rescue: pre-rescue state restored');
+        return null;
+      } catch (re) {
+        return `cannot recover data directory ${dir} to a consistent state: ${(re as Error).message}; ${kept}`;
+      }
+    }
+  }
+  if (journal.phase === 'done') {
+    try {
+      rescueRollForwardCleanup(dir, journal);
+      err('completed an interrupted rescue: snapshot state committed');
+      return null;
+    } catch (e) {
+      return `cannot finish interrupted rescue for data directory ${dir}: ${(e as Error).message}; ${kept}`;
+    }
+  }
+  // rolling-back:进入回退后只能继续还原救援前状态。
+  try {
+    rescueRollback(dir, journal);
+    rescueRollbackCleanup(dir, journal);
+    err('continued an interrupted rescue rollback: pre-rescue state restored');
+    return null;
+  } catch (e) {
+    return `cannot complete interrupted rescue rollback for data directory ${dir}: ${(e as Error).message}; ${kept}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 启动自恢复(持锁调用)
 // ---------------------------------------------------------------------------
 
@@ -522,11 +869,34 @@ function resumeRestore(dir: string, journal: Journal): string | null {
 }
 
 /**
- * 任一命令启动时(持锁)调用:若上次恢复被中断,先把数据目录续接为完整
- * 快照状态或完整旧状态,绝不留下或查询混合状态。没有日志时清理可能残留
- * 的临时文件。成功(或无需恢复)返回 null,无法完成返回错误消息。
+ * 任一命令启动时(持锁)调用:若上次恢复或救援被中断,先把数据目录续接为
+ * 完整快照状态或完整旧状态(救援则续接为完整快照或完整救援前状态),绝不
+ * 留下或查询混合状态。没有日志时清理可能残留的临时文件。成功(或无需
+ * 恢复)返回 null,无法完成返回错误消息。
  */
 function recoverIfNeeded(dir: string): string | null {
+  // 救援事务优先:救援进行中旧 restore.journal 可能仍在或已被放弃,一律以
+  // 救援日志为准续接。
+  const rescueJournalPath = join(dir, RESCUE_JOURNAL_NAME);
+  if (existsSync(rescueJournalPath)) {
+    let journal: RescueJournal | null = null;
+    try {
+      journal = parseRescueJournal(JSON.parse(readFileSync(rescueJournalPath, 'utf8')));
+    } catch {
+      journal = null;
+    }
+    if (journal === null) {
+      return (
+        `cannot recover data directory ${dir}: rescue journal ${rescueJournalPath} is unreadable or invalid; ` +
+        `the directory may hold rescue materials in an unknown state - nothing was deleted; ` +
+        `inspect ${RESCUE_JOURNAL_NAME} and '${PRESERVE_DIR_PREFIX}*' directories before retrying`
+      );
+    }
+    const rescueError = resumeRescue(dir, journal);
+    if (rescueError !== null) return rescueError;
+    // 救援续接完成后继续常规检查:回退可能刚把损坏的 restore.journal 还原
+    // 到位,普通命令必须继续拒绝,不能就此开放受阻状态。
+  }
   const journalPath = join(dir, JOURNAL_NAME);
   if (existsSync(journalPath)) {
     let journal: Journal | null = null;
@@ -539,7 +909,9 @@ function recoverIfNeeded(dir: string): string | null {
       return (
         `cannot recover data directory ${dir}: restore journal ${journalPath} is unreadable or invalid; ` +
         `the directory may hold restore materials in an unknown state - nothing was deleted; ` +
-        `inspect ${JOURNAL_NAME} and '*${OLD_SUFFIX}'/'*${NEW_SUFFIX}' files before retrying`
+        `use 'node app.ts rescue <snapshot>' with a known-good snapshot to explicitly abandon ` +
+        `the interrupted restore (the current state will be preserved first), or inspect ` +
+        `${JOURNAL_NAME} and '*${OLD_SUFFIX}'/'*${NEW_SUFFIX}' files before retrying`
       );
     }
     return resumeRestore(dir, journal);
@@ -557,9 +929,12 @@ function recoverIfNeeded(dir: string): string | null {
       }
     }
   }
-  // 日志阶段翻转时用的临时名(原子换名前被杀会留下死临时),不影响判定。
+  // 日志阶段翻转时用的临时名与救援还原临时文件(原子换名前被杀会留下死
+  // 临时),不影响判定。rescue-preserve-* 留存目录不属于残留,绝不自动清理。
   for (const entry of readdirSync(dir)) {
-    if (entry.startsWith(`${JOURNAL_NAME}.tmp-`)) {
+    if (entry.startsWith(`${JOURNAL_NAME}.tmp-`) ||
+        entry.startsWith(`${RESCUE_JOURNAL_NAME}.tmp-`) ||
+        entry.includes(RESCUE_TMP_MARK)) {
       try {
         rmSync(join(dir, entry));
       } catch (e) {
@@ -780,50 +1155,49 @@ export function cmdBackup(outPath: string): number {
   return 0;
 }
 
-/**
- * 从快照整库恢复。在目录操作权与自恢复协调之内运行:协调完成后才读取并
- * 校验快照(故损坏的当前库不影响恢复,恢复不以解析旧库为前提)。快照须通过
- * 格式版本与完整性校验,且三个业务存储的结构与关联一致,否则不开始替换。
- * 成功后业务状态完全等于快照。返回进程退出码。
- */
-export function cmdRestore(snapshotPath: string): number {
-  const dir = dataDirPath();
-  if (isInsideDir(dir, snapshotPath)) {
-    err(`snapshot file '${snapshotPath}' must be located outside the data directory ${dir}`);
-    return 2;
-  }
+interface SnapshotStores {
+  data: StoreData;
+  alerts: AlertState;
+  groups: Group[];
+}
 
+/**
+ * 读取并校验快照:格式标识、格式版本、SHA-256 完整性校验,以及三个业务
+ * 存储的结构与关联(沿用旧快照兼容规则)。任一校验失败打印原因并返回
+ * null(调用方返回 1),不开始任何替换、不改动原库与旧事务材料。
+ */
+function loadValidatedSnapshot(snapshotPath: string): SnapshotStores | null {
   let text: string;
   try {
     text = readFileSync(resolve(snapshotPath), 'utf8');
   } catch (e) {
     err(`cannot read snapshot '${snapshotPath}': ${(e as Error).message}`);
-    return 1;
+    return null;
   }
   let envelope: unknown;
   try {
     envelope = JSON.parse(text);
   } catch {
     err(`snapshot '${snapshotPath}' is corrupted (invalid JSON or truncated); nothing was restored`);
-    return 1;
+    return null;
   }
   const env = envelope as Record<string, unknown>;
   if (env === null || typeof env !== 'object' || env.format !== SNAPSHOT_FORMAT) {
     err(`snapshot '${snapshotPath}' is not a meterwatch snapshot; nothing was restored`);
-    return 1;
+    return null;
   }
   if (env.version !== SNAPSHOT_VERSION) {
     err(
       `snapshot '${snapshotPath}' has unsupported format version ${String(env.version)} ` +
         `(this build supports version ${SNAPSHOT_VERSION}); nothing was restored`,
     );
-    return 1;
+    return null;
   }
   const payloadText = JSON.stringify(env.payload) ?? '';
   const checksum = createHash('sha256').update(payloadText, 'utf8').digest('hex');
   if (typeof env.checksum !== 'string' || env.checksum !== `sha256:${checksum}`) {
     err(`snapshot '${snapshotPath}' failed its integrity check; nothing was restored`);
-    return 1;
+    return null;
   }
 
   const payload = env.payload as Record<string, unknown>;
@@ -837,7 +1211,7 @@ export function cmdRestore(snapshotPath: string): number {
   } catch (e) {
     if (e instanceof StoreError) {
       err(`${e.message}; nothing was restored`);
-      return 1;
+      return null;
     }
     throw e;
   }
@@ -845,16 +1219,40 @@ export function cmdRestore(snapshotPath: string): number {
   if (problems.length > 0) {
     for (const p of problems) err(p);
     err(`restore rejected: snapshot has ${problems.length} consistency problem(s); nothing was restored`);
-    return 1;
+    return null;
+  }
+  return { data, alerts, groups };
+}
+
+/** 把校验过的快照内容序列化为三个业务存储文件内容。 */
+function snapshotBodies(snap: SnapshotStores): Array<{ name: string; body: string }> {
+  return [
+    { name: basename(dataFilePath()), body: JSON.stringify(serializeStoreData(snap.data), null, 2) + '\n' },
+    { name: basename(alertFilePath()), body: JSON.stringify(serializeAlertState(snap.alerts), null, 2) + '\n' },
+    { name: basename(groupFilePath()), body: JSON.stringify(serializeGroups(snap.groups), null, 2) + '\n' },
+  ];
+}
+
+/**
+ * 从快照整库恢复。在目录操作权与自恢复协调之内运行:协调完成后才读取并
+ * 校验快照(故损坏的当前库不影响恢复,恢复不以解析旧库为前提)。快照须通过
+ * 格式版本与完整性校验,且三个业务存储的结构与关联一致,否则不开始替换。
+ * 成功后业务状态完全等于快照。返回进程退出码。
+ */
+export function cmdRestore(snapshotPath: string): number {
+  const dir = dataDirPath();
+  if (isInsideDir(dir, snapshotPath)) {
+    err(`snapshot file '${snapshotPath}' must be located outside the data directory ${dir}`);
+    return 2;
   }
 
+  const snap = loadValidatedSnapshot(snapshotPath);
+  if (snap === null) return 1;
+
   // 快照校验全部通过后才开始替换;调用方已持有目录操作权。
+  const bodies = snapshotBodies(snap);
   try {
-    commitRestore(dir, [
-      { path: dataFilePath(), body: JSON.stringify(serializeStoreData(data), null, 2) + '\n' },
-      { path: alertFilePath(), body: JSON.stringify(serializeAlertState(alerts), null, 2) + '\n' },
-      { path: groupFilePath(), body: JSON.stringify(serializeGroups(groups), null, 2) + '\n' },
-    ]);
+    commitRestore(dir, bodies.map((b) => ({ path: join(dir, b.name), body: b.body })));
   } catch (e) {
     if (e instanceof StoreError) {
       err(e.message);
@@ -863,6 +1261,154 @@ export function cmdRestore(snapshotPath: string): number {
     throw e;
   }
 
-  console.log(`restored from snapshot '${snapshotPath}': ${countsReport(data, alerts, groups)}`);
+  console.log(`restored from snapshot '${snapshotPath}': ${countsReport(snap.data, snap.alerts, snap.groups)}`);
   return 0;
+}
+
+/**
+ * 救援命令的目录协调:取得数据目录操作权,并先续接被中断的救援事务
+ * (rescue.journal),然后运行业务动作。与 withDirectoryCoordination 不同,
+ * 不处理旧 restore 事务——救援存在的意义就是显式放弃无法可靠续接的旧
+ * 事务(其材料会先被完整留存)。锁被存活进程占用或中断救援无法续接时
+ * 返回 1,不读写业务存储、不动任何材料。
+ */
+function withRescueCoordination<T>(action: () => T): T | number {
+  const dir = dataDirPath();
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    err(`cannot access data directory ${dir}: ${(e as Error).message}`);
+    return 1;
+  }
+  const lockError = acquireLock(dir);
+  if (lockError !== null) {
+    err(lockError);
+    return 1;
+  }
+  try {
+    const rescueJournalPath = join(dir, RESCUE_JOURNAL_NAME);
+    if (existsSync(rescueJournalPath)) {
+      let journal: RescueJournal | null = null;
+      try {
+        journal = parseRescueJournal(JSON.parse(readFileSync(rescueJournalPath, 'utf8')));
+      } catch {
+        journal = null;
+      }
+      if (journal === null) {
+        err(
+          `cannot recover data directory ${dir}: rescue journal ${rescueJournalPath} is unreadable or invalid; ` +
+            `the directory may hold rescue materials in an unknown state - nothing was deleted; ` +
+            `inspect ${RESCUE_JOURNAL_NAME} and '${PRESERVE_DIR_PREFIX}*' directories before retrying`,
+        );
+        return 1;
+      }
+      const resumeError = resumeRescue(dir, journal);
+      if (resumeError !== null) {
+        err(resumeError);
+        return 1;
+      }
+    }
+    return action();
+  } finally {
+    releaseLock(dir);
+  }
+}
+
+/**
+ * 显式快照救援:当恢复日志损坏、普通入口(含 restore)被阻塞时,显式放弃
+ * 旧事务并把三个业务存储整体替换为完好快照。
+ *
+ * 不解析当前库与旧日志;允许三个业务文件损坏、缺失或混合。先按与 restore
+ * 相同的规则校验快照(无效快照返回 1,不改动原库与旧事务材料),再把救援前
+ * 的三个业务文件、restore.journal 及对应 *.restore-old/*.restore-new 的原始
+ * 字节与缺失状态完整留存到 rescue-preserve-* 目录(留存不完整绝不替换),随后
+ * 放弃旧事务材料、整体换入快照内容。留存目录不被启动或后续恢复自动清理,
+ * 目录内其他已有文件不变。读写或重命名失败返回 1 并还原救援前状态;还原
+ * 受阻则保留全部材料并阻止业务。返回进程退出码。
+ */
+export function cmdRescue(snapshotPath: string): number {
+  return withRescueCoordination<number>(() => {
+    const dir = dataDirPath();
+    if (isInsideDir(dir, snapshotPath)) {
+      err(`snapshot file '${snapshotPath}' must be located outside the data directory ${dir}`);
+      return 2;
+    }
+
+    const snap = loadValidatedSnapshot(snapshotPath);
+    if (snap === null) return 1;
+    const bodies = snapshotBodies(snap);
+
+    // 留存救援前状态;留存不完整绝不替换。此阶段不触碰业务文件与旧事务材料。
+    const preserveDir = uniquePreserveDirName(dir);
+    try {
+      writePreservation(dir, preserveDir, bodies);
+    } catch (e) {
+      err(
+        `cannot preserve pre-rescue state in ${join(dir, preserveDir)}: ${(e as Error).message}; ` +
+          `nothing was replaced`,
+      );
+      return 1;
+    }
+
+    // 留存完成后才创建救援日志并开始替换;被中断由启动续接(见 resumeRescue)。
+    const journal: RescueJournal = { phase: 'committing', preserveDir };
+    try {
+      writeRescueJournal(dir, journal, 'committing');
+    } catch (e) {
+      err(
+        `cannot start rescue in ${dir}: ${(e as Error).message}; nothing was replaced; ` +
+          `pre-rescue state was preserved in ${join(dir, preserveDir)}`,
+      );
+      return 1;
+    }
+    try {
+      rescueRollForward(dir, journal);
+    } catch (e) {
+      // 受控失败:进入 rolling-back 后只能继续还原救援前状态(幂等,可中断)。
+      let rollbackStarted = true;
+      try {
+        writeRescueJournal(dir, journal, 'rolling-back');
+      } catch (we) {
+        rollbackStarted = false;
+        err(
+          `rescue failed (${(e as Error).message}) and the rollback could not be started ` +
+            `(${(we as Error).message}); data directory ${dir} keeps all rescue materials ` +
+            `(${RESCUE_JOURNAL_NAME}, ${preserveDir}/) - run any meterwatch command again ` +
+            `to continue; nothing else may use the directory until then`,
+        );
+      }
+      if (rollbackStarted) {
+        try {
+          rescueRollback(dir, journal);
+          rescueRollbackCleanup(dir, journal);
+          err(`rescue failed: ${(e as Error).message}; pre-rescue state restored`);
+          return 1;
+        } catch (re) {
+          err(
+            `rescue failed (${(e as Error).message}); rollback is in progress and could not finish ` +
+              `(${(re as Error).message}); data directory ${dir} keeps all materials needed to ` +
+              `continue - run any meterwatch command again to finish restoring the pre-rescue state`,
+          );
+          return 1;
+        }
+      }
+      return 1;
+    }
+    try {
+      writeRescueJournal(dir, journal, 'done');
+      rescueRollForwardCleanup(dir, journal);
+    } catch (e) {
+      err(
+        `snapshot state was committed but post-commit cleanup failed: ${(e as Error).message}; ` +
+          `run any meterwatch command again to finish cleanup`,
+      );
+      return 1;
+    }
+
+    console.log(
+      `rescued from snapshot '${snapshotPath}': ${countsReport(snap.data, snap.alerts, snap.groups)}`,
+    );
+    console.log(`pre-rescue state preserved in '${join(dir, preserveDir)}' (kept, never auto-cleaned)`);
+    return 0;
+  });
 }
