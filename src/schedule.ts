@@ -101,7 +101,10 @@ export function parseSchedule(text: string): ScheduleWindow[] | string {
     if (parts.length !== 3) {
       return `${where}: expect '<weekday> <start HH:mm> <end HH:mm>' (weekday: mon..sun)`;
     }
-    const dow = DOW_BY_NAME[parts[0].toLowerCase()];
+    // 只用自身属性查星期:constructor、__proto__、toString 等原型链上的名字
+    // 不是合法星期,必须按非法星期拒绝,不能静默当成某个窗口或空窗口。
+    const dowName = parts[0].toLowerCase();
+    const dow = Object.hasOwn(DOW_BY_NAME, dowName) ? DOW_BY_NAME[dowName] : undefined;
     if (dow === undefined) {
       return `${where}: unknown weekday '${parts[0]}' (expect mon, tue, wed, thu, fri, sat or sun)`;
     }

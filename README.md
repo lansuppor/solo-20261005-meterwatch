@@ -477,6 +477,19 @@ node app.ts rule create --id peak --device meter-1 --threshold 9007199254740.990
 串保存毫千瓦时。数值型毫千瓦时若已超出安全整数范围(JSON 解析时精度
 已丢失),按损坏数据拒绝,不猜测原值。
 
+## 回归测试
+
+```sh
+npm test          # 或 node tests/regression.mjs
+```
+
+分组非运行时段告警的本地回归测试:离线运行,需要 Node.js 24,无外部依赖。
+测试在独立临时目录中自建数据目录与素材,通过 `node app.ts` 命令入口以新进程
+执行各场景,核对退出码、业务输出与持久化状态;预期 UTC 时段、覆盖秒数与精确
+消耗按"原读数区间起点累计比例向下取整求片段差"独立列明,不与产品计算函数
+或产品输出互比。全部通过返回 0,任一断言失败返回非零并指出场景;结束时自动
+清理临时材料,不触碰用户数据目录。
+
 ## 数据位置
 
 `$METERWATCH_DATA_DIR/readings.json`,默认 `~/.meterwatch/readings.json`;
