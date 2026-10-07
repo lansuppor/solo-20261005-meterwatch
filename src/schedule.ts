@@ -1,10 +1,16 @@
 // group schedule-report 子命令:按本地每周运行时间表把查询范围划分为运行与
 // 非运行两类时段,分别核查分组能耗的只读报表,用于核查停运消耗。
 //
-// - 时间表为零个或多个每周窗口:开始星期 + 起止 HH:mm。开始限 00:00-23:59,
-//   结束另可 24:00;同值起止拒绝;结束早于开始即跨至下一日(尾段沿用开始
-//   日规则,周日可跨至周一)。窗口起点含、终点不含,重叠或重复取并集;空表
-//   (零个窗口)表示全部非运行。
+// - 时间表为零个或多个每周窗口加零个或多个日期例外。每周窗口:开始星期 +
+//   起止 HH:mm。开始限 00:00-23:59,结束另可 24:00;同值起止拒绝;结束早于
+//   开始即跨至下一日(尾段沿用开始日规则,周日可跨至周一)。窗口起点含、
+//   终点不含,重叠或重复取并集;空表(零个窗口且零个例外)表示全部非运行。
+// - 日期例外:真实 YYYY-MM-DD 指定当天运行窗口(限当日 00:00-24:00,起点含、
+//   终点不含且起点更早,不跨夜)或明确全天停运(off)。例外按查询/规则时区的
+//   当地日期匹配,整体替换该日期的运行集合(包括上一日每周跨夜窗口的尾段),
+//   仅作用于当天,其他日期仍用每周表;同日期窗口取并集,重复或等价拆分不影响
+//   含义;全天停运与该日期窗口并存须拒绝。旧格式(只有每周窗口)仍可使用,
+//   也允许只有例外。
 // - 分类按实际时刻的当地日期与墙钟:每秒只属一类;夏令时跳过时段不虚构
 //   覆盖,回拨重复时段各自分类,不套固定偏移或日长。--tz 只解释时间表,
 //   不重新解释起止时刻或已存读数。
@@ -46,6 +52,28 @@ export interface ScheduleWindow {
   endMin: number;
 }
 
+export interface ExceptionWindow {
+  /** 例外日当日起始分钟,0..1439。 */
+  startMin: number;
+  /** 例外日当日结束分钟(不含),恒大于 startMin 且不超过 1440(不跨夜)。 */
+  endMin: number;
+}
+
+export interface DateException {
+  /** 例外的当地日期,YYYY-MM-DD(真实日期)。 */
+  date: string;
+  /** 全天停运:true 时 windows 必为空,当天运行集合为空。 */
+  shutdown: boolean;
+  /** 当天运行窗口(分钟,限当日 00:00-24:00,并集语义);shutdown 时为空。 */
+  windows: ExceptionWindow[];
+}
+
+/** 运行时间表:每周窗口 + 日期例外。例外按当地日期整体替换当天运行集合。 */
+export interface Schedule {
+  windows: ScheduleWindow[];
+  exceptions: DateException[];
+}
+
 const DOW_BY_NAME: Record<string, number> = {
   sun: 0,
   mon: 1,
@@ -84,13 +112,19 @@ function parseHm(raw: string, allow24: boolean): number | null {
 }
 
 /**
- * 解析每周运行时间表文本。每行一个窗口:<星期> <开始 HH:mm> <结束 HH:mm>;
- * 空行与 # 之后的注释忽略。星期为 mon..sun(不区分大小写)。开始限
- * 00:00-23:59,结束另可 24:00;同值起止拒绝;结束早于开始跨至下一日。
- * 重叠或重复窗口不在此拒绝,分类时取并集。非法时返回错误消息字符串。
+ * 解析运行时间表文本。每行一条:
+ * - 每周窗口:<星期> <开始 HH:mm> <结束 HH:mm>;星期为 mon..sun(不区分
+ *   大小写),开始限 00:00-23:59,结束另可 24:00;同值起止拒绝;结束早于
+ *   开始跨至下一日。重叠或重复窗口不在此拒绝,分类时取并集。
+ * - 日期例外:<YYYY-MM-DD> <开始 HH:mm> <结束 HH:mm> 指定当天运行窗口
+ *   (限当日 00:00-24:00,起点含、终点不含且起点更早,不跨夜),或
+ *   <YYYY-MM-DD> off 明确全天停运。日期必须为真实日期;同日期窗口取并集,
+ *   重复或等价拆分不影响含义;全天停运与该日期窗口并存拒绝。
+ * 空行与 # 之后的注释忽略。非法时返回错误消息字符串。
  */
-export function parseSchedule(text: string): ScheduleWindow[] | string {
+export function parseSchedule(text: string): Schedule | string {
   const windows: ScheduleWindow[] = [];
+  const excByDate = new Map<string, { shutdown: boolean; windows: ExceptionWindow[] }>();
   const lines = text.split(/\r\n|\r|\n/);
   for (let i = 0; i < lines.length; i++) {
     const hash = lines[i].indexOf('#');
@@ -98,6 +132,49 @@ export function parseSchedule(text: string): ScheduleWindow[] | string {
     if (line === '') continue;
     const where = `line ${i + 1}`;
     const parts = line.split(/\s+/);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(parts[0])) {
+      // 日期例外行:真实 YYYY-MM-DD;`off` 全天停运,否则为当天运行窗口。
+      const date = parts[0];
+      if (parseUtcDate(date) === null) {
+        return `${where}: invalid date '${date}' (expect a real YYYY-MM-DD date)`;
+      }
+      let entry = excByDate.get(date);
+      if (parts.length === 2 && parts[1].toLowerCase() === 'off') {
+        if (entry !== undefined && entry.windows.length > 0) {
+          return `${where}: date ${date} has both running windows and 'off' (full-day shutdown)`;
+        }
+        if (entry === undefined) {
+          entry = { shutdown: false, windows: [] };
+          excByDate.set(date, entry);
+        }
+        entry.shutdown = true;
+        continue;
+      }
+      if (parts.length !== 3) {
+        return `${where}: expect '<date> off' or '<date> <start HH:mm> <end HH:mm>'`;
+      }
+      const start = parseHm(parts[1], false);
+      if (start === null) {
+        return `${where}: invalid start time '${parts[1]}' (expect HH:mm within 00:00-23:59)`;
+      }
+      const end = parseHm(parts[2], true);
+      if (end === null) {
+        return `${where}: invalid end time '${parts[2]}' (expect HH:mm within 00:00-24:00)`;
+      }
+      // 例外窗口限当日 00:00-24:00:起点含、终点不含且起点更早,不跨夜。
+      if (end <= start) {
+        return `${where}: end must be later than start for a date exception (windows stay within 00:00-24:00 of ${date})`;
+      }
+      if (entry !== undefined && entry.shutdown) {
+        return `${where}: date ${date} has both 'off' (full-day shutdown) and running windows`;
+      }
+      if (entry === undefined) {
+        entry = { shutdown: false, windows: [] };
+        excByDate.set(date, entry);
+      }
+      entry.windows.push({ startMin: start, endMin: end });
+      continue;
+    }
     if (parts.length !== 3) {
       return `${where}: expect '<weekday> <start HH:mm> <end HH:mm>' (weekday: mon..sun)`;
     }
@@ -124,7 +201,12 @@ export function parseSchedule(text: string): ScheduleWindow[] | string {
     const endMin = end < start ? end + 1440 : end;
     windows.push({ startDow: dow, startMin: start, endMin });
   }
-  return windows;
+  const exceptions: DateException[] = [...excByDate.entries()].map(([date, e]) => ({
+    date,
+    shutdown: e.shutdown,
+    windows: e.windows,
+  }));
+  return { windows, exceptions };
 }
 
 /**
@@ -165,25 +247,97 @@ export function canonicalizeWindows(windows: ScheduleWindow[]): ScheduleWindow[]
 }
 
 /**
- * 时间表的展示形式:`dow HH:mm-HH:mm` 列表(逗号分隔);结束可跨夜,
- * 小时可大于 24(相对开始日)。零个窗口显示为 `(no running windows)`。
+ * 把日期例外规范化为最简形式:同日期窗口取分钟并集(合并为升序、互不重叠、
+ * 互不相邻的窗口),全天停运的日期窗口为空;例外按日期升序排列。同日期窗口
+ * 的顺序、重复及等价拆分(如 09:00-10:00 加 10:00-11:00 对比 09:00-11:00)
+ * 不影响规范形,故规范形相同当且仅当日期映射及各日窗口并集相同。
  */
-export function formatSchedule(windows: ScheduleWindow[]): string {
-  if (windows.length === 0) return '(no running windows)';
-  const hm = (min: number): string =>
-    `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
-  return windows
-    .map((w) => `${DOW_NAMES[w.startDow]} ${hm(w.startMin)}-${hm(w.endMin)}`)
-    .join(', ');
+export function canonicalizeExceptions(exceptions: DateException[]): DateException[] {
+  const byDate = new Map<string, DateException>();
+  for (const e of exceptions) {
+    const cur = byDate.get(e.date);
+    if (cur === undefined) {
+      byDate.set(e.date, { date: e.date, shutdown: e.shutdown, windows: [...e.windows] });
+    } else {
+      cur.shutdown = cur.shutdown || e.shutdown;
+      cur.windows.push(...e.windows);
+    }
+  }
+  const out: DateException[] = [];
+  for (const e of byDate.values()) {
+    if (e.shutdown) {
+      out.push({ date: e.date, shutdown: true, windows: [] });
+      continue;
+    }
+    const covered = new Uint8Array(1440);
+    for (const w of e.windows) {
+      for (let m = w.startMin; m < w.endMin; m++) covered[m] = 1;
+    }
+    const wins: ExceptionWindow[] = [];
+    let m = 0;
+    while (m < 1440) {
+      if (covered[m] === 0) {
+        m++;
+        continue;
+      }
+      const s = m;
+      while (m < 1440 && covered[m] === 1) m++;
+      wins.push({ startMin: s, endMin: m });
+    }
+    out.push({ date: e.date, shutdown: false, windows: wins });
+  }
+  out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return out;
+}
+
+/** 整个时间表的规范形:每周窗口并集 + 例外日期映射及各日窗口并集。 */
+export function canonicalizeSchedule(schedule: Schedule): Schedule {
+  return {
+    windows: canonicalizeWindows(schedule.windows),
+    exceptions: canonicalizeExceptions(schedule.exceptions),
+  };
+}
+
+/** HH:mm 显示(分钟数可超过 1439,用于跨夜每周窗口的相对结束)。 */
+function hmText(min: number): string {
+  return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+}
+
+/** 单个例外的展示形式,如 `2026-01-01 off` 或 `2026-01-02 10:00-14:00,16:00-18:00`。 */
+export function formatException(exception: DateException): string {
+  if (exception.shutdown) return `${exception.date} off`;
+  const wins = exception.windows.map((w) => `${hmText(w.startMin)}-${hmText(w.endMin)}`).join(',');
+  return `${exception.date} ${wins}`;
 }
 
 /**
- * 解析存储中的时间表字段(窗口数组,元素为 {startDow, startMin, endMin}):
- * startDow 0..6,startMin 0..1439,endMin 大于 startMin 且不超过两天(规范
- * 形窗口最多跨至下一日结束,与分类的回看口径一致)。非法返回 null,由
- * 调用方按损坏数据处理。
+ * 时间表的展示形式:每周部分为 `dow HH:mm-HH:mm` 列表(逗号分隔;结束可跨夜,
+ * 小时可大于 24),零个每周窗口显示为 `(no running windows)`;有例外时追加
+ * `exceptions=<日期>:<off|窗口(+分隔)>`,例外按日期升序、空格分隔。
  */
-export function validateStoredSchedule(value: unknown): ScheduleWindow[] | null {
+export function formatSchedule(schedule: Schedule): string {
+  const weekly =
+    schedule.windows.length === 0
+      ? '(no running windows)'
+      : schedule.windows
+          .map((w) => `${DOW_NAMES[w.startDow]} ${hmText(w.startMin)}-${hmText(w.endMin)}`)
+          .join(', ');
+  if (schedule.exceptions.length === 0) return weekly;
+  const exc = schedule.exceptions
+    .map(
+      (e) =>
+        `${e.date}:${e.shutdown ? 'off' : e.windows.map((w) => `${hmText(w.startMin)}-${hmText(w.endMin)}`).join('+')}`,
+    )
+    .join(' ');
+  return `${weekly} exceptions=${exc}`;
+}
+
+/**
+ * 解析存储中的每周窗口数组(元素为 {startDow, startMin, endMin}):
+ * startDow 0..6,startMin 0..1439,endMin 大于 startMin 且不超过两天(规范
+ * 形窗口最多跨至下一日结束,与分类的回看口径一致)。非法返回 null。
+ */
+function validateStoredWindows(value: unknown): ScheduleWindow[] | null {
   if (!Array.isArray(value)) return null;
   const out: ScheduleWindow[] = [];
   for (const w of value) {
@@ -211,6 +365,72 @@ export function validateStoredSchedule(value: unknown): ScheduleWindow[] | null 
   return out;
 }
 
+/**
+ * 解析存储中的例外数组(元素为 {date, shutdown, windows:[{startMin,endMin}]}):
+ * date 为真实 YYYY-MM-DD 且不重复;窗口限当日 00:00-24:00(0<=start<end<=1440);
+ * 全天停运(shutdown)的日期窗口必须为空,非停运日期至少一个窗口(明确停运与
+ * 没有例外不同,空窗口非停运条目没有含义)。非法返回 null,按损坏数据处理。
+ */
+function validateStoredExceptions(value: unknown): DateException[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return null;
+  const seen = new Set<string>();
+  const out: DateException[] = [];
+  for (const e of value) {
+    if (e === null || typeof e !== 'object') return null;
+    const o = e as Record<string, unknown>;
+    if (typeof o.date !== 'string' || parseUtcDate(o.date) === null) return null;
+    if (seen.has(o.date)) return null;
+    seen.add(o.date);
+    if (typeof o.shutdown !== 'boolean' || !Array.isArray(o.windows)) return null;
+    const wins: ExceptionWindow[] = [];
+    for (const w of o.windows as unknown[]) {
+      if (w === null || typeof w !== 'object') return null;
+      const wo = w as Record<string, unknown>;
+      if (
+        !Number.isSafeInteger(wo.startMin) ||
+        (wo.startMin as number) < 0 ||
+        (wo.startMin as number) > 1439 ||
+        !Number.isSafeInteger(wo.endMin) ||
+        (wo.endMin as number) <= (wo.startMin as number) ||
+        (wo.endMin as number) > 1440
+      ) {
+        return null;
+      }
+      wins.push({ startMin: wo.startMin as number, endMin: wo.endMin as number });
+    }
+    if (o.shutdown) {
+      if (wins.length > 0) return null;
+    } else if (wins.length === 0) {
+      return null;
+    }
+    out.push({ date: o.date, shutdown: o.shutdown, windows: wins });
+  }
+  return out;
+}
+
+/**
+ * 解析存储中的时间表字段。兼容两种形态:
+ * - 旧版:每周窗口数组(无例外);
+ * - 新版:{ windows: [...], exceptions: [...] }(exceptions 可省略,视为无例外)。
+ * 非法返回 null,由调用方按损坏数据处理。
+ */
+export function validateStoredSchedule(value: unknown): Schedule | null {
+  if (Array.isArray(value)) {
+    const windows = validateStoredWindows(value);
+    return windows === null ? null : { windows, exceptions: [] };
+  }
+  if (value !== null && typeof value === 'object') {
+    const o = value as Record<string, unknown>;
+    const windows = validateStoredWindows(o.windows);
+    if (windows === null) return null;
+    const exceptions = validateStoredExceptions(o.exceptions);
+    if (exceptions === null) return null;
+    return { windows, exceptions };
+  }
+  return null;
+}
+
 interface Period {
   /** 时段起点(含),epoch 秒。 */
   start: number;
@@ -225,32 +445,43 @@ function dowOfNaive(naiveMidnight: number): number {
 }
 
 /**
- * 把 [from, to) 按每周时间表分为运行与非运行两类实际 UTC 时段,两类合计
- * 恰好等于查询范围(每秒只属一类)。分类按实际时刻的当地日期与墙钟:
- * 墙钟段切分自命名时区(段内偏移恒定、当地日期单一),窗口墙钟区间与段
- * 墙钟区间求交后换算回 UTC;夏令时跳过的墙钟没有实际时刻,不虚构覆盖,
- * 回拨重复的墙钟两段实际时段各自分类,不套固定偏移或日长。
+ * 把 [from, to) 按时间表分为运行与非运行两类实际 UTC 时段,两类合计恰好
+ * 等于查询范围(每秒只属一类)。分类按实际时刻的当地日期与墙钟:墙钟段切分
+ * 自命名时区(段内偏移恒定、当地日期单一),窗口墙钟区间与段墙钟区间求交后
+ * 换算回 UTC;夏令时跳过的墙钟没有实际时刻,不虚构覆盖,回拨重复的墙钟两段
+ * 实际时段各自分类,不套固定偏移或日长。日期例外按当地日期匹配,整体替换
+ * 该日期的运行集合(包括上一日每周跨夜窗口的尾段),仅作用于当天,其他日期
+ * 仍用每周表;全天停运的日期运行集合为空。
  */
 export function classifyPeriods(
   fmt: Intl.DateTimeFormat,
   from: number,
   to: number,
-  windows: ScheduleWindow[],
+  schedule: Schedule,
 ): { running: Period[]; nonRunning: Period[] } {
+  const windows = schedule.windows;
+  const excByDate = new Map(schedule.exceptions.map((e) => [e.date, e]));
   const raw: Period[] = [];
-  if (windows.length > 0) {
-    // 各当地日期生效的窗口墙钟区间(按墙钟午夜缓存):本日开始的窗口,以及
-    // 上一日开始、跨至本日的窗口尾段。
+  if (windows.length > 0 || schedule.exceptions.length > 0) {
+    // 各当地日期生效的窗口墙钟区间(按墙钟午夜缓存):有例外时为例外窗口
+    // (全天停运为空,整体替换,含上一日每周跨夜窗口的尾段);否则为本日开始
+    // 的每周窗口,以及上一日开始、跨至本日的每周窗口尾段。
     const wallByDate = new Map<string, Array<[number, number]>>();
     const wallIntervalsOf = (label: string): Array<[number, number]> => {
       const cached = wallByDate.get(label);
       if (cached) return cached;
       const dayNaive = parseUtcDate(label) as number;
-      const wall: Array<[number, number]> = [];
-      for (const w of windows) {
-        for (const startNaive of [dayNaive, dayNaive - 86400]) {
-          if (dowOfNaive(startNaive) !== w.startDow) continue;
-          wall.push([startNaive + w.startMin * 60, startNaive + w.endMin * 60]);
+      let wall: Array<[number, number]>;
+      const exc = excByDate.get(label);
+      if (exc !== undefined) {
+        wall = exc.windows.map((w) => [dayNaive + w.startMin * 60, dayNaive + w.endMin * 60]);
+      } else {
+        wall = [];
+        for (const w of windows) {
+          for (const startNaive of [dayNaive, dayNaive - 86400]) {
+            if (dowOfNaive(startNaive) !== w.startDow) continue;
+            wall.push([startNaive + w.startMin * 60, startNaive + w.endMin * 60]);
+          }
         }
       }
       wallByDate.set(label, wall);
@@ -324,7 +555,7 @@ export function cmdGroupScheduleReport(opts: {
     err(`invalid schedule file ${opts.schedulePath}: ${parsed}`);
     return 2;
   }
-  const windows = parsed;
+  const schedule = parsed;
 
   let groups: Group[];
   try {
@@ -353,10 +584,14 @@ export function cmdGroupScheduleReport(opts: {
     throw e;
   }
 
-  const { running, nonRunning } = classifyPeriods(tz, opts.from, opts.to, windows);
+  const { running, nonRunning } = classifyPeriods(tz, opts.from, opts.to, schedule);
 
   console.log(`group: ${group.id}`);
-  console.log(`schedule: ${opts.schedulePath} (${windows.length} window(s))`);
+  const excText =
+    schedule.exceptions.length > 0 ? `, ${schedule.exceptions.length} exception(s)` : '';
+  console.log(
+    `schedule: ${opts.schedulePath} (${schedule.windows.length} window(s)${excText})`,
+  );
   console.log(`timezone: ${tzName}`);
   console.log(`max-interval: ${maxIntervalText(opts.maxInterval)}`);
 

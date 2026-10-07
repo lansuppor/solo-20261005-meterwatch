@@ -84,6 +84,43 @@ const S2 = {
   rawGap2: '2026-01-13T01:00:00Z..2026-01-13T02:30:00Z',
 };
 
+// S3 独立场景(日期例外:节假日停运 + 临时运行,UTC):
+//   读数 m:2026-01-05T00:00Z 0.000 -> 2026-01-08T00:00Z 7.000(区间 259200s,
+//   diff=7000 毫千瓦时)。cum(t)=floor(7000*(t-起点)/259200):
+//     01-06 00:00 = 2333;01-06 09:00 = 3208;01-06 11:00 = 3402;
+//     01-07 00:00 = 4666;01-08 00:00 = 7000。
+//   时间表:mon 12:00-18:00;例外 2026-01-05 off(全天停运),2026-01-06 09:00-11:00。
+//   周一(例外停运):非运行全天 86400s,消耗 2333-0 = 2333 = 2.333 kWh。
+//   周二(例外窗口):非运行 [00:00,09:00)+[11:00,24:00) = 79200s,
+//     消耗 (3208-2333)+(4666-3402) = 875+1264 = 2139 = 2.139 kWh。
+//   周三(无例外,每周表无周三窗口):非运行全天,消耗 7000-4666 = 2334 = 2.334 kWh。
+//   阈值 2.000 => 三天分别触发 alert-1/2/3。
+const S3 = {
+  mon: '2.333',
+  tue: '2.139',
+  wed: '2.334',
+  tueSeconds: 79200,
+};
+
+// S4 独立场景(例外替换上一日每周跨夜窗口尾段,UTC):
+//   读数 m:2026-01-04T00:00Z 0.000 -> 2026-01-06T00:00Z 2.000(172800s,
+//   diff=2000)。cum(01-04 22:00)=floor(2000*79200/172800)=916;
+//   cum(01-05 00:00)=1000;cum(01-06 00:00)=2000。
+//   时间表:sun 22:00 02:00(跨至周一 02:00)+ 例外 2026-01-05 off。
+//   周日:非运行 [00:00,22:00) = 79200s,消耗 916 = 0.916 kWh。
+//   周一:例外停运替换全天运行集合(含每周跨夜尾段 00:00-02:00)=>
+//     非运行全天 86400s,消耗 2000-1000 = 1000 = 1.000 kWh,单一时段。
+//   报表(01-04..01-06):运行 = [周日22:00,周一00:00) 7200s,消耗 84 = 0.084;
+//     非运行 165600s,消耗 916+1000 = 1916 = 1.916;合计 172800s / 2.000。
+const S4 = {
+  sunNr: '0.916',
+  monNr: '1.000',
+  runningSeconds: 7200,
+  nonRunningSeconds: 165600,
+  runningKwh: '0.084',
+  nonRunningKwh: '1.916',
+};
+
 const failures = [];
 let passed = 0;
 function check(scenario, cond, detail) {
@@ -698,6 +735,253 @@ function scenarioNoRecoverOnUndecidable() {
   }
 }
 
+// S3:日期例外(节假日停运 + 临时运行)替换当天运行集合;评估与历史显示所用
+// 例外;等价拆分/重复重试不新增;明确停运与没有例外冲突;备份恢复完整保留。
+function scenarioExceptions() {
+  const S = 'S3 date exceptions (holiday shutdown / temporary run) replace the day schedule';
+  const dir = makeDataDir();
+  const snapDir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), ['device,time,reading',
+      'm,2026-01-05T00:00:00Z,0.000',
+      'm,2026-01-08T00:00:00Z,7.000',
+      '',
+    ].join('\n'));
+    write(join(dir, 'sched.txt'), 'mon 12:00 18:00\n2026-01-05 off\n2026-01-06 09:00 11:00\n');
+    // 等价形式:每周窗口拆分、例外窗口拆分、例外重复且顺序不同。
+    write(join(dir, 'sched-split.txt'),
+      'mon 12:00 15:00\nmon 15:00 18:00\n2026-01-06 09:00 10:00\n2026-01-06 10:00 11:00\n2026-01-05 off\n2026-01-05 off\n');
+    // 没有例外(明确停运与没有例外不同)。
+    write(join(dir, 'sched-noexc.txt'), 'mon 12:00 18:00\n');
+    // 01-06 改为全天停运(窗口与停运是不同参数)。
+    write(join(dir, 'sched-off.txt'), 'mon 12:00 18:00\n2026-01-05 off\n2026-01-06 off\n');
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g', '--at', '2026-01-01T00:00:00Z', '--device', 'm']);
+    check(S, r.code === 0, `group rc=${r.code} ${r.err}`);
+    r = run(dir, ['rule', 'create', '--id', 'nr', '--group', 'g', '--threshold', '2.000', '--schedule', 'sched.txt']);
+    check(S, r.code === 0, `rule create rc=${r.code} ${r.err}`);
+
+    // 等价拆分/重复/乱序重试:不新增;异参(无例外 / 例外不同)冲突且不改状态。
+    r = run(dir, ['rule', 'create', '--id', 'nr', '--group', 'g', '--threshold', '2.000', '--schedule', 'sched-split.txt']);
+    check(S, r.code === 0 && /already exists with identical parameters/.test(r.out) && /unchanged/.test(r.out),
+      `equivalent exception split retry must be unchanged: rc=${r.code} out=${JSON.stringify(r.out)}`);
+    r = run(dir, ['rule', 'create', '--id', 'nr', '--group', 'g', '--threshold', '2.000', '--schedule', 'sched-noexc.txt']);
+    check(S, r.code === 1 && /conflict/.test(r.out + r.err),
+      `missing exceptions must conflict (shutdown differs from no exception): rc=${r.code}`);
+    r = run(dir, ['rule', 'create', '--id', 'nr', '--group', 'g', '--threshold', '2.000', '--schedule', 'sched-off.txt']);
+    check(S, r.code === 1 && /conflict/.test(r.out + r.err), `different exception kind must conflict: rc=${r.code}`);
+    check(S, readJson(dir, 'alerts.json').rules.length === 1, 'conflicts must not add rules');
+
+    // 源文件随后修改/删除不影响规则。
+    rmSync(join(dir, 'sched.txt'));
+    rmSync(join(dir, 'sched-split.txt'));
+    rmSync(join(dir, 'sched-noexc.txt'));
+    rmSync(join(dir, 'sched-off.txt'));
+
+    // rule list 显示例外日期及窗口或全天停运。
+    r = run(dir, ['rule', 'list']);
+    check(S, r.code === 0 && /exceptions=2026-01-05:off 2026-01-06:09:00-11:00/.test(r.out),
+      `rule list must show exception dates with windows/shutdown:\n${r.out}`);
+
+    // 评估三天:例外替换当天运行集合,其余日期仍用每周表;显示所用例外。
+    r = run(dir, ['evaluate', '--rule', 'nr', '--from', '2026-01-05', '--to', '2026-01-08']);
+    check(S, r.code === 0, `evaluate rc=${r.code} ${r.err}`);
+    check(S, /2026-01-05[^\n]*consumption=2\.333 kWh > threshold=2\.000 kWh[^\n]*EXCEEDED[^\n]*alert alert-1 triggered/.test(r.out),
+      `Monday shutdown exception must be fully non-running at 2.333:\n${r.out}`);
+    check(S, /2026-01-05[^\n]*valid=86400s anomaly=0s unknown=0s/.test(r.out), 'Monday fully valid 86400s');
+    check(S, /2026-01-06[^\n]*consumption=2\.139 kWh[^\n]*alert alert-2 triggered/.test(r.out),
+      `Tuesday exception windows non-running must be 2.139:\n${r.out}`);
+    check(S, /2026-01-06[^\n]*valid=79200s anomaly=0s unknown=0s/.test(r.out), 'Tuesday non-running 79200s');
+    check(S, /2026-01-07[^\n]*consumption=2\.334 kWh[^\n]*alert alert-3 triggered/.test(r.out),
+      `Wednesday falls back to weekly table at 2.334:\n${r.out}`);
+    check(S, r.out.includes('exception: 2026-01-05 off (replaces weekly windows for this local date)'),
+      `evaluate must show the shutdown exception used:\n${r.out}`);
+    check(S, r.out.includes('exception: 2026-01-06 09:00-11:00 (replaces weekly windows for this local date)'),
+      `evaluate must show the window exception used:\n${r.out}`);
+    check(S, countOccurrences(r.out, /exception: /g) === 2, 'exactly the two exception dates are shown');
+    check(S, r.out.includes('period=2026-01-06T00:00:00Z..2026-01-06T09:00:00Z') &&
+      r.out.includes('period=2026-01-06T11:00:00Z..2026-01-07T00:00:00Z'),
+      `Tuesday non-running periods must surround the exception window:\n${r.out}`);
+    check(S, readJson(dir, 'alerts.json').alerts.length === 3, 'three alerts persisted');
+
+    // 历史同样显示当前消耗、非运行时段与所用例外。
+    r = run(dir, ['alerts', '--rule', 'nr', '--from', '2026-01-05', '--to', '2026-01-08']);
+    check(S, r.code === 0 && /2026-01-06[^\n]*consumption=2\.139 kWh \(EXCEEDED/.test(r.out),
+      `alerts must show current non-running consumption:\n${r.out}`);
+    check(S, countOccurrences(r.out, /exception: /g) === 2, 'alerts shows the exceptions used');
+    check(S, r.out.includes('period=2026-01-06T11:00:00Z..2026-01-07T00:00:00Z'), 'alerts shows exception-day periods');
+
+    // 备份恢复完整保留每周表与例外;恢复后规则与评估继续可用。
+    const snap = join(snapDir, 'snap.json');
+    r = run(dir, ['backup', snap]);
+    check(S, r.code === 0, `backup rc=${r.code} ${r.err}`);
+    r = run(dir, ['restore', snap]);
+    check(S, r.code === 0, `restore rc=${r.code} ${r.err}`);
+    r = run(dir, ['rule', 'list']);
+    check(S, r.code === 0 && /exceptions=2026-01-05:off 2026-01-06:09:00-11:00/.test(r.out),
+      `exceptions must survive backup/restore:\n${r.out}`);
+    r = run(dir, ['evaluate', '--rule', 'nr', '--from', '2026-01-05', '--to', '2026-01-06']);
+    check(S, r.code === 0 && /alert alert-1 remains triggered/.test(r.out),
+      `evaluation after restore uses the restored exceptions:\n${r.out}`);
+
+    // 只有例外的时间表(无每周窗口)也可创建并显示。
+    write(join(dir, 'exc-only.txt'), '2026-01-06 09:00 11:00\n');
+    r = run(dir, ['rule', 'create', '--id', 'exc-only', '--group', 'g', '--threshold', '9', '--schedule', 'exc-only.txt']);
+    check(S, r.code === 0, `exceptions-only rule rc=${r.code} ${r.err}`);
+    r = run(dir, ['rule', 'list']);
+    check(S, /rule exc-only[^\n]*\(no running windows\) exceptions=2026-01-06:09:00-11:00/.test(r.out),
+      `exceptions-only rule must list with no weekly windows:\n${r.out}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(snapDir, { recursive: true, force: true });
+  }
+}
+
+// S4:例外替换上一日每周跨夜窗口的尾段,仅作用于当天;报表两类合计与分组
+// 日报一致;例外窗口覆盖全天时说明无非运行秒数的原因。
+function scenarioExceptionTail() {
+  const S = 'S4 exception replaces previous-day weekly overnight tail; report totals match group daily';
+  const dir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), ['device,time,reading',
+      'm,2026-01-04T00:00:00Z,0.000',
+      'm,2026-01-06T00:00:00Z,2.000',
+      '',
+    ].join('\n'));
+    write(join(dir, 'tail.txt'), 'sun 22:00 02:00\n2026-01-05 off\n');
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g', '--at', '2026-01-01T00:00:00Z', '--device', 'm']);
+    check(S, r.code === 0, `group rc=${r.code} ${r.err}`);
+    r = run(dir, ['rule', 'create', '--id', 'tail', '--group', 'g', '--threshold', '10', '--schedule', 'tail.txt']);
+    check(S, r.code === 0, `rule rc=${r.code} ${r.err}`);
+
+    r = run(dir, ['evaluate', '--rule', 'tail', '--from', '2026-01-04', '--to', '2026-01-06']);
+    check(S, r.code === 0, `evaluate rc=${r.code} ${r.err}`);
+    check(S, /2026-01-04[^\n]*consumption=0\.916 kWh[^\n]*NORMAL/.test(r.out) &&
+      /2026-01-04[^\n]*valid=79200s/.test(r.out),
+      `Sunday non-running [00:00,22:00) must be 0.916 over 79200s:\n${r.out}`);
+    check(S, /2026-01-05[^\n]*consumption=1\.000 kWh[^\n]*NORMAL/.test(r.out) &&
+      /2026-01-05[^\n]*valid=86400s anomaly=0s unknown=0s/.test(r.out),
+      `Monday exception must replace the overnight tail (full 86400s non-running):\n${r.out}`);
+    check(S, r.out.includes('period=2026-01-05T00:00:00Z..2026-01-06T00:00:00Z'),
+      'Monday must be a single full-day non-running period');
+    check(S, !r.out.includes('2026-01-05T02:00:00Z..'),
+      'weekly overnight tail into Monday must be replaced by the exception');
+    check(S, r.out.includes('exception: 2026-01-05 off'), 'exception used must be shown');
+
+    // 报表交叉核对:运行只剩周日 22:00-24:00 段,两类合计等于查询时长与日报总量。
+    r = run(dir, ['group', 'schedule-report', '--id', 'g', '--schedule', 'tail.txt',
+      '--from', '2026-01-04T00:00:00Z', '--to', '2026-01-06T00:00:00Z']);
+    check(S, r.code === 0, `report rc=${r.code} ${r.err}`);
+    check(S, r.out.includes('(1 window(s), 1 exception(s))'), `report header counts exceptions:\n${r.out}`);
+    check(S, r.out.includes('period=2026-01-04T22:00:00Z..2026-01-05T00:00:00Z'),
+      `running class keeps only the Sunday evening segment:\n${r.out}`);
+    check(S, new RegExp(`class=running[^\\n]*consumption=${S4.runningKwh.replace('.', '\\.')} kWh`).test(r.out) &&
+      /class=running[^\n]*valid=7200s  anomaly=0s  unknown=0s/.test(r.out),
+      `running class must be 0.084 over 7200s:\n${r.out}`);
+    check(S, new RegExp(`class=non-running[^\\n]*consumption=${S4.nonRunningKwh.replace('.', '\\.')} kWh`).test(r.out) &&
+      /class=non-running[^\n]*valid=165600s/.test(r.out),
+      `non-running class must be 1.916 over 165600s:\n${r.out}`);
+    check(S, /running=7200s  non-running=165600s  total=172800s/.test(r.out),
+      'class seconds must sum to the query length');
+    r = run(dir, ['group', 'daily', '--id', 'g',
+      '--from', '2026-01-04T00:00:00Z', '--to', '2026-01-06T00:00:00Z']);
+    check(S, r.code === 0 && r.out.includes('total consumption=2.000 kWh'),
+      `class consumption sum (0.084+1.916) must match group daily total 2.000:\n${r.out}`);
+
+    // 例外窗口覆盖全天:没有非运行秒数,说明原因,不判定不告警。
+    write(join(dir, 'cov.txt'), '2026-01-05 00:00 24:00\n');
+    r = run(dir, ['rule', 'create', '--id', 'cov', '--group', 'g', '--threshold', '1', '--schedule', 'cov.txt']);
+    check(S, r.code === 0, `cov rule rc=${r.code} ${r.err}`);
+    r = run(dir, ['evaluate', '--rule', 'cov', '--from', '2026-01-05', '--to', '2026-01-06']);
+    check(S, r.code === 0 &&
+      /NO NON-RUNNING COVERAGE \(date exception windows cover the whole local date\)  no alert action/.test(r.out),
+      `exception windows covering the whole day must explain no non-running coverage:\n${r.out}`);
+    check(S, readJson(dir, 'alerts.json').alerts.length === 0, 'no alert for a fully running exception day');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// S5:非法例外(假日期、停运与窗口并存、跨夜/同值窗口、形状错误)返回 2 且不改
+// 业务文件;不可读文件返回 1;已存非法例外按损坏拒绝;旧版数组时间表仍可用。
+function scenarioExceptionInvalid() {
+  const S = 'S5 invalid exceptions rejected (rc 2), unreadable file rc 1, corrupt stored exceptions rc 1';
+  const dir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), 'device,time,reading\nz,2026-01-05T00:00:00Z,0.000\nz,2026-01-06T00:00:00Z,1.000\n');
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g', '--at', '2026-01-01T00:00:00Z', '--device', 'z']);
+    check(S, r.code === 0, `group rc=${r.code} ${r.err}`);
+
+    const before = storeSnapshot(dir);
+    const badFiles = {
+      'bad-date.txt': '2026-02-30 off\n',
+      'bad-both.txt': '2026-01-05 off\n2026-01-05 10:00 12:00\n',
+      'bad-both2.txt': '2026-01-05 10:00 12:00\n2026-01-05 off\n',
+      'bad-overnight.txt': '2026-01-05 12:00 10:00\n',
+      'bad-equal.txt': '2026-01-05 10:00 10:00\n',
+      'bad-shape.txt': '2026-01-05 10:00\n',
+    };
+    for (const [name, body] of Object.entries(badFiles)) {
+      write(join(dir, name), body);
+      r = run(dir, ['rule', 'create', '--id', `bad-${name}`, '--group', 'g', '--threshold', '1', '--schedule', name]);
+      check(S, r.code === 2, `${name} must be rc=2, got ${r.code} (${r.both.trim()})`);
+      check(S, /invalid schedule/.test(r.err), `${name} must report invalid schedule: ${r.err}`);
+      const diff = sameSnapshot(before, storeSnapshot(dir));
+      check(S, diff === null, `rejected ${name} must not change business files (${diff})`);
+    }
+    // 报表入口同样拒绝非法例外。
+    r = run(dir, ['group', 'schedule-report', '--id', 'g', '--schedule', 'bad-date.txt',
+      '--from', '2026-01-05T00:00:00Z', '--to', '2026-01-06T00:00:00Z']);
+    check(S, r.code === 2 && /invalid schedule/.test(r.err), `report rejects invalid exception rc=${r.code}`);
+    // 不可读时间表文件返回 1。
+    r = run(dir, ['rule', 'create', '--id', 'missing', '--group', 'g', '--threshold', '1', '--schedule', 'no-such.txt']);
+    check(S, r.code === 1 && /cannot read schedule file/.test(r.err), `unreadable schedule rc=${r.code}`);
+    check(S, readJson(dir, 'alerts.json') === null, 'no rules may be created from rejected schedules');
+
+    // 已存非法例外(停运与窗口并存)按损坏数据拒绝。
+    write(join(dir, 'alerts.json'), JSON.stringify({
+      version: 2,
+      nextAlertNum: 1,
+      nextEventSeq: 1,
+      rules: [{
+        id: 'corrupt', targetType: 'group', targetId: 'g', thresholdMilli: '1000', tz: 'UTC',
+        mode: 'non-running',
+        schedule: { windows: [], exceptions: [{ date: '2026-01-05', shutdown: true, windows: [{ startMin: 600, endMin: 720 }] }] },
+      }],
+      alerts: [],
+    }) + '\n');
+    r = run(dir, ['rule', 'list']);
+    check(S, r.code === 1 && /corrupted/.test(r.err), `corrupt stored exception must be rc=1: ${r.err}`);
+
+    // 旧版数组形式(无例外)的规则无需迁移即可使用。
+    write(join(dir, 'alerts.json'), JSON.stringify({
+      version: 2,
+      nextAlertNum: 1,
+      nextEventSeq: 1,
+      rules: [{
+        id: 'legacy', targetType: 'group', targetId: 'g', thresholdMilli: '1000', tz: 'UTC',
+        mode: 'non-running',
+        schedule: [{ startDow: 1, startMin: 720, endMin: 1080 }],
+      }],
+      alerts: [],
+    }) + '\n');
+    r = run(dir, ['rule', 'list']);
+    check(S, r.code === 0 && /rule legacy[^\n]*mode=non-running schedule=mon 12:00-18:00/.test(r.out) &&
+      !/exceptions=/.test(r.out),
+      `legacy array schedule must load without exceptions:\n${r.out}`);
+    r = run(dir, ['evaluate', '--rule', 'legacy', '--from', '2026-01-05', '--to', '2026-01-06']);
+    check(S, r.code === 0 && /2026-01-05[^\n]*NORMAL|EXCEEDED/.test(r.out),
+      `legacy rule evaluates with weekly windows only:\n${r.out}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const scenarios = [
   scenarioS1,
   scenarioDst,
@@ -707,6 +991,9 @@ const scenarios = [
   scenarioBadWeekday,
   scenarioLifecycle,
   scenarioWriteFailure,
+  scenarioExceptions,
+  scenarioExceptionTail,
+  scenarioExceptionInvalid,
 ];
 
 for (const sc of scenarios) {
