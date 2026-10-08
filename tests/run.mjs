@@ -15,6 +15,9 @@
 //   已经换入后的完成记录写入、事务材料清理与回退方向记录写入处制造可控失败,
 //   核对退出码、无成功输出、全部固定文件的字节与存在状态,以及解除故障后的
 //   跨进程回退(故障必须真实到达收尾,不以获取锁失败代替)。
+// - C 场景覆盖两期能耗对比(group compare):全有效与分组日报汇总一致、成员
+//   切换、异常优先排除、一侧未知导致不可计算、--max-interval 两侧同限与
+//   裁切不可信、相同经过秒数拆分查询相加一致,以及参数/数据错误退出码。
 // - 全部断言通过进程退出码 0;任一失败退出码非零并指出场景名。
 //
 // 预期值全部在下方 EXPECTED 中按口径手工/独立推导(原读数区间起点累计比例
@@ -1686,6 +1689,177 @@ function scenarioRescueTailFailures() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// C1..C6:同一分组两期等长时段的只读能耗对比(group compare)。
+// 独立推导(分摊口径 cum=floor(diff*(t-start)/dur),片段为两端累计量之差):
+//   a 参考期 [01-01,01-02) diff=10.000;比较期 [01-08,01-09) diff=10.000。
+//   b 参考期 diff=5.000;比较期 diff=3.000。f 仅比较期 [01-08,01-09) diff=3.000。
+//   g1 成员:v1={a,b}(2025-12-01 起),v2={a,f}(01-08 06:00 起,落在比较期中段)。
+//   C1 全有效:参考期消耗 = 10.000+5.000 = 15.000;
+//     比较期 = [00,06) a 2.500+b 0.750 + [06,24) a 7.500+f 2.250 = 13.000;
+//     差值 = 13.000-15.000 = -2.000;与两范围各自的分组日报汇总一致。
+//   C3(g3={a,e}):e 参考期 [01-01 12:00,01-02) 下降(6.000->3.000)=> 异常
+//     43200 秒;前半可比:参考 = a 5.000 + e 6.000 = 11.000,
+//     比较 = a 5.000 + e 0.500 = 5.500,差值 -5.500。
+//   C2(g2={a,d}):d 末条读数在 01-02,比较期整段未知 => 可比为零,两侧及
+//     差值均无法计算。
+//   C5 拆分一致:两期都在经过 43200 秒处拆开查询,覆盖/消耗/差值相加等于整段
+//     (半段:参考 7.500 / 比较 6.500 / 差值 -1.000,两段相同)。
+// ---------------------------------------------------------------------------
+function scenarioCompare() {
+  const S = 'C group compare (two-period aligned read-only report)';
+  const dir = makeDataDir();
+  try {
+    write(join(dir, 'r.csv'), [
+      'device,time,reading',
+      'a,2026-01-01T00:00:00Z,0.000',
+      'a,2026-01-02T00:00:00Z,10.000',
+      'a,2026-01-08T00:00:00Z,20.000',
+      'a,2026-01-09T00:00:00Z,30.000',
+      'b,2026-01-01T00:00:00Z,0.000',
+      'b,2026-01-02T00:00:00Z,5.000',
+      'b,2026-01-08T00:00:00Z,5.000',
+      'b,2026-01-09T00:00:00Z,8.000',
+      'f,2026-01-08T00:00:00Z,100.000',
+      'f,2026-01-09T00:00:00Z,103.000',
+      'e,2026-01-01T00:00:00Z,0.000',
+      'e,2026-01-01T12:00:00Z,6.000',
+      'e,2026-01-02T00:00:00Z,3.000',
+      'e,2026-01-08T00:00:00Z,0.000',
+      'e,2026-01-09T00:00:00Z,1.000',
+      'd,2026-01-01T00:00:00Z,0.000',
+      'd,2026-01-02T00:00:00Z,4.000',
+      '',
+    ].join('\n'));
+    let r = run(dir, ['import', 'r.csv']);
+    check(S, r.code === 0, `import rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g1', '--at', '2025-12-01T00:00:00Z', '--device', 'a', '--device', 'b']);
+    check(S, r.code === 0, `g1 v1 rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g1', '--at', '2026-01-08T06:00:00Z', '--device', 'a', '--device', 'f']);
+    check(S, r.code === 0, `g1 v2 rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g2', '--at', '2025-12-01T00:00:00Z', '--device', 'a', '--device', 'd']);
+    check(S, r.code === 0, `g2 rc=${r.code} ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'g3', '--at', '2025-12-01T00:00:00Z', '--device', 'a', '--device', 'e']);
+    check(S, r.code === 0, `g3 rc=${r.code} ${r.err}`);
+
+    const cmpArgs = (id, rf, rt, cf, ct, extra = []) =>
+      ['group', 'compare', '--id', id, '--ref-from', rf, '--ref-to', rt, '--cmp-from', cf, '--cmp-to', ct, ...extra];
+    const REF = ['2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'];
+    const CMP = ['2026-01-08T00:00:00Z', '2026-01-09T00:00:00Z'];
+
+    // C1:全有效 + 比较期中段成员切换;只读,不改任何业务存储。
+    const before = storeSnapshot(dir);
+    r = run(dir, cmpArgs('g1', ...REF, ...CMP));
+    check(S, r.code === 0, `C1 rc=${r.code} ${r.err}`);
+    check(S, /side=reference {2}valid=86400s {2}anomaly=0s {2}unknown=0s/.test(r.out) &&
+      /side=comparison {2}valid=86400s {2}anomaly=0s {2}unknown=0s/.test(r.out),
+      `C1 side coverage:\n${r.out}`);
+    check(S, r.out.includes('members=a,b  period=2026-01-08T00:00:00Z..2026-01-08T06:00:00Z') &&
+      r.out.includes('members=a,f  period=2026-01-08T06:00:00Z..2026-01-09T00:00:00Z'),
+      `C1 member periods per side:\n${r.out}`);
+    check(S, /comparable=86400s {2}anomaly-excluded=0s {2}unknown-excluded=0s/.test(r.out) &&
+      !/INCOMPLETE/.test(r.out), `C1 comparable coverage:\n${r.out}`);
+    check(S, r.out.includes('reference consumption=15.000 kWh') &&
+      r.out.includes('comparison consumption=13.000 kWh') &&
+      r.out.includes('difference=-2.000 kWh (comparison - reference)'),
+      `C1 consumption and signed difference:\n${r.out}`);
+    check(S, /status=complete/.test(r.out), `C1 status:\n${r.out}`);
+    check(S, sameSnapshot(before, storeSnapshot(dir)) === null, 'C1 read-only: stores unchanged');
+    // 两侧全有效时,各侧消耗与同范围分组日报汇总一致。
+    r = run(dir, ['group', 'daily', '--id', 'g1', '--from', REF[0], '--to', REF[1]]);
+    check(S, r.code === 0 && /total consumption=15\.000 kWh/.test(r.out), `C1 ref side == group daily:\n${r.out}`);
+    r = run(dir, ['group', 'daily', '--id', 'g1', '--from', CMP[0], '--to', CMP[1]]);
+    check(S, r.code === 0 && /total consumption=13\.000 kWh/.test(r.out), `C1 cmp side == group daily:\n${r.out}`);
+
+    // C1b:两期相同(允许重叠/相同),有效零增长差值显示 0.000。
+    r = run(dir, cmpArgs('g1', ...REF, ...REF));
+    check(S, r.code === 0 && r.out.includes('difference=0.000 kWh') &&
+      r.out.includes('reference consumption=15.000 kWh') &&
+      r.out.includes('comparison consumption=15.000 kWh'),
+      `C1b identical periods zero difference:\n${r.out}`);
+
+    // C2:比较期一侧整段未知 => 可比为零,两侧及差值明确无法计算,返回 0。
+    r = run(dir, cmpArgs('g2', ...REF, ...CMP));
+    check(S, r.code === 0, `C2 rc=${r.code} ${r.err}`);
+    check(S, /side=comparison {2}valid=0s {2}anomaly=0s {2}unknown=86400s/.test(r.out) &&
+      r.out.includes('class=excluded-unknown  sides=comparison'),
+      `C2 unknown side and pair class:\n${r.out}`);
+    check(S, /comparable=0s {2}anomaly-excluded=0s {2}unknown-excluded=86400s {2}INCOMPLETE/.test(r.out) &&
+      r.out.includes('reference consumption=n/a (no comparable coverage)') &&
+      r.out.includes('comparison consumption=n/a (no comparable coverage)') &&
+      r.out.includes('difference=n/a (no comparable coverage)'),
+      `C2 non-computable:\n${r.out}`);
+
+    // C3:参考期后段任一成员下降 => 异常排除(优先于未知),只前半可比。
+    r = run(dir, cmpArgs('g3', ...REF, ...CMP));
+    check(S, r.code === 0, `C3 rc=${r.code} ${r.err}`);
+    check(S, /side=reference {2}valid=43200s {2}anomaly=43200s {2}unknown=0s/.test(r.out) &&
+      /side=comparison {2}valid=86400s {2}anomaly=0s {2}unknown=0s/.test(r.out),
+      `C3 side coverage:\n${r.out}`);
+    check(S, r.out.includes(
+      'pair ref=2026-01-01T00:00:00Z..2026-01-01T12:00:00Z  cmp=2026-01-08T00:00:00Z..2026-01-08T12:00:00Z  class=comparable') &&
+      r.out.includes(
+      'pair ref=2026-01-01T12:00:00Z..2026-01-02T00:00:00Z  cmp=2026-01-08T12:00:00Z..2026-01-09T00:00:00Z  class=excluded-anomaly  sides=reference'),
+      `C3 paired UTC periods:\n${r.out}`);
+    check(S, /comparable=43200s {2}anomaly-excluded=43200s {2}unknown-excluded=0s {2}INCOMPLETE/.test(r.out) &&
+      r.out.includes('reference consumption=11.000 kWh') &&
+      r.out.includes('comparison consumption=5.500 kWh') &&
+      r.out.includes('difference=-5.500 kWh'),
+      `C3 comparable-only consumption:\n${r.out}`);
+
+    // C4:--max-interval 同一限制用于两侧;超过限制整段未知并指出侧别/设备/
+    // 原相邻读数时刻;等于限制仍可信;裁切不使过长区间可信。
+    r = run(dir, cmpArgs('g1', ...REF, ...CMP, ['--max-interval', '3600']));
+    check(S, r.code === 0 &&
+      /side=reference {2}valid=0s {2}anomaly=0s {2}unknown=86400s {2}gap=86400s/.test(r.out) &&
+      /side=comparison {2}valid=0s {2}anomaly=0s {2}unknown=86400s {2}gap=86400s/.test(r.out) &&
+      r.out.includes('gap: side=reference  device=a  interval=2026-01-01T00:00:00Z..2026-01-02T00:00:00Z') &&
+      r.out.includes('gap: side=comparison  device=f  interval=2026-01-08T00:00:00Z..2026-01-09T00:00:00Z') &&
+      /comparable=0s {2}anomaly-excluded=0s {2}unknown-excluded=86400s {2}INCOMPLETE/.test(r.out) &&
+      r.out.includes('difference=n/a'),
+      `C4 gap limit both sides:\n${r.out}`);
+    r = run(dir, cmpArgs('g1', ...REF, ...CMP, ['--max-interval', '86400']));
+    check(S, r.code === 0 && r.out.includes('difference=-2.000 kWh') && /status=complete/.test(r.out),
+      `C4 equal-to-limit trusted:\n${r.out}`);
+    r = run(dir, cmpArgs('g1', '2026-01-01T06:00:00Z', '2026-01-01T18:00:00Z',
+      '2026-01-08T06:00:00Z', '2026-01-08T18:00:00Z', ['--max-interval', '3600']));
+    check(S, r.code === 0 && /comparable=0s {2}anomaly-excluded=0s {2}unknown-excluded=43200s/.test(r.out),
+      `C4 cropped query does not make long interval trusted:\n${r.out}`);
+
+    // C5:两期在相同经过秒数(43200)处分段查询,覆盖/消耗/差值相加等于整段。
+    const half1 = run(dir, cmpArgs('g1', '2026-01-01T00:00:00Z', '2026-01-01T12:00:00Z',
+      '2026-01-08T00:00:00Z', '2026-01-08T12:00:00Z'));
+    const half2 = run(dir, cmpArgs('g1', '2026-01-01T12:00:00Z', '2026-01-02T00:00:00Z',
+      '2026-01-08T12:00:00Z', '2026-01-09T00:00:00Z'));
+    for (const [name, h] of [['half1', half1], ['half2', half2]]) {
+      check(S, h.code === 0 && /comparable=43200s/.test(h.out) &&
+        h.out.includes('reference consumption=7.500 kWh') &&
+        h.out.includes('comparison consumption=6.500 kWh') &&
+        h.out.includes('difference=-1.000 kWh'),
+        `C5 ${name} split values:\n${h.out}`);
+    }
+
+    // C6:参数与数据错误。
+    r = run(dir, cmpArgs('g1', REF[0], REF[1], CMP[0], '2026-01-09T00:00:01Z'));
+    check(S, r.code === 2 && /相等/.test(r.err), `C6 unequal durations rc=${r.code} ${r.err}`);
+    r = run(dir, cmpArgs('g1', REF[1], REF[0], CMP[0], CMP[1]));
+    check(S, r.code === 2, `C6 ref-from >= ref-to rc=${r.code}`);
+    r = run(dir, cmpArgs('g1', '2026-01-01', REF[1], CMP[0], CMP[1]));
+    check(S, r.code === 2, `C6 invalid time rc=${r.code}`);
+    r = run(dir, cmpArgs('g1', ...REF, ...CMP, ['--max-interval', '0']));
+    check(S, r.code === 2, `C6 invalid max-interval rc=${r.code}`);
+    r = run(dir, ['group', 'compare', '--id', 'g1', '--ref-from', REF[0], '--ref-to', REF[1], '--cmp-from', CMP[0]]);
+    check(S, r.code === 2, `C6 missing flag rc=${r.code}`);
+    r = run(dir, cmpArgs('nope', ...REF, ...CMP));
+    check(S, r.code === 1 && /unknown group/.test(r.err) && !/comparable=/.test(r.out),
+      `C6 unknown group rc=${r.code}, no partial report`);
+    r = run(dir, ['group']);
+    check(S, r.code === 2 && /compare/.test(r.err), `C6 group subcommand list mentions compare: ${r.err}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const scenarios = [
   scenarioS1,
   scenarioDst,
@@ -1703,6 +1877,7 @@ const scenarios = [
   scenarioRescueInterrupted,
   scenarioRescueFailureRollback,
   scenarioRescueTailFailures,
+  scenarioCompare,
 ];
 
 for (const sc of scenarios) {

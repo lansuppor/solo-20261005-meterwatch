@@ -186,9 +186,9 @@ function floorIndex(series: Reading[], s: number): number {
   return ans;
 }
 
-type SliceKind = 'valid' | 'anomaly' | 'unknown';
+export type SliceKind = 'valid' | 'anomaly' | 'unknown';
 
-interface DeviceSlice {
+export interface DeviceSlice {
   kind: SliceKind;
   consumption: bigint;
   /** kind 为 unknown 且由超过采样间隔限制的区间造成时的原始区间(相邻读数时刻)。 */
@@ -203,7 +203,7 @@ interface DeviceSlice {
  * 间隔限制(秒):非下降区间的完整实际时间差(不按片段裁短)超过限制时
  * 整个区间为未知,等于限制仍可信;下降区间即使超过限制仍为异常。
  */
-function deviceSlice(
+export function deviceSlice(
   series: Reading[],
   s: number,
   e: number,
