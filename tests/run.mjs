@@ -1,4 +1,4 @@
-// 分组非运行时段告警 —— 本地离线回归测试。
+// 分组非运行时段告警与快照救援事务 —— 本地离线回归测试。
 //
 // 运行(在仓库根目录):
 //   node tests/run.mjs
@@ -9,6 +9,12 @@
 //   绝不触碰默认 ~/.meterwatch 或其他使用者数据。
 // - 主要场景一律以「新进程」运行现有命令入口 `node app.ts ...`,核对退出码、
 //   业务输出(stdout/stderr)与三个业务存储(readings/alerts/groups)的持久化状态。
+// - R1..R4 覆盖显式救援(rescue):日志损坏拒绝、留存字节与缺失状态、中断续接、
+//   回退方向钉死,以及收尾读写失败的回退保证。R4 用产品内置的离线故障钩子
+//   (环境变量 METERWATCH_TEST_FAULT,仅测试时设置,正常使用零行为)在三个存储
+//   已经换入后的完成记录写入、事务材料清理与回退方向记录写入处制造可控失败,
+//   核对退出码、无成功输出、全部固定文件的字节与存在状态,以及解除故障后的
+//   跨进程回退(故障必须真实到达收尾,不以获取锁失败代替)。
 // - 全部断言通过进程退出码 0;任一失败退出码非零并指出场景名。
 //
 // 预期值全部在下方 EXPECTED 中按口径手工/独立推导(原读数区间起点累计比例
@@ -102,6 +108,43 @@ function run(dataDir, args, cwd = dataDir) {
     env: { ...process.env, METERWATCH_DATA_DIR: dataDir },
   });
   return { code: res.status, out: res.stdout ?? '', err: res.stderr ?? '', both: (res.stdout ?? '') + (res.stderr ?? '') };
+}
+
+// 带可控故障点的跨进程运行:产品代码只在设置 METERWATCH_TEST_FAULT(逗号分隔)
+// 时启用离线测试钩子,未设置时零行为。故障点见 src/backup.ts 的 testFaults()。
+function runFault(dataDir, args, faults, cwd = dataDir) {
+  const res = spawnSync(process.execPath, [APP, ...args], {
+    encoding: 'utf8',
+    cwd,
+    env: { ...process.env, METERWATCH_DATA_DIR: dataDir, METERWATCH_TEST_FAULT: faults },
+  });
+  return { code: res.status, out: res.stdout ?? '', err: res.stderr ?? '', both: (res.stdout ?? '') + (res.stderr ?? '') };
+}
+
+// 救援事务固定名字集(10 个):三个业务存储 + 各自 .restore-old/.restore-new
+// + restore.journal。逐项核对原始字节与缺失状态。
+const FIXED_RESCUE_NAMES = (() => {
+  const names = [];
+  for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
+    names.push(n, `${n}.restore-old`, `${n}.restore-new`);
+  }
+  names.push('restore.journal');
+  return names;
+})();
+function fixedRescueSnapshot(dir) {
+  const out = {};
+  for (const name of FIXED_RESCUE_NAMES) {
+    const p = join(dir, name);
+    out[name] = existsSync(p) ? { exists: true, raw: readFileSync(p) } : { exists: false, raw: null };
+  }
+  return out;
+}
+function sameFixedRescue(a, b) {
+  for (const name of FIXED_RESCUE_NAMES) {
+    if (a[name].exists !== b[name].exists) return `${name} existence changed`;
+    if (a[name].exists && !a[name].raw.equals(b[name].raw)) return `${name} bytes changed`;
+  }
+  return null;
 }
 
 function write(path, body) {
@@ -1152,8 +1195,9 @@ function scenarioRescue() {
   }
 }
 
-// R2:救援在留存/替换/回退中被中断后,任一命令启动先续接为完整快照或完整退回
-// 救援前状态,不开放混合库;确定回退后不得改向,退回后普通命令继续拒绝。
+// R2:救援在留存/替换/回退中被中断后,任一命令启动先续接:留存阶段中断放弃救援;
+// 换入后、成功报告前的中断(含日志停在 committing)统一收敛为完整退回救援前状态,
+// 不开放混合库、绝不前滚提交;确定回退后不得改向,退回后普通命令继续拒绝。
 function scenarioRescueInterrupted() {
   const S = 'R2 interrupted rescue continuation (preserving/committing/rolling-back)';
   const mkJournal = (phase, preservedDir, preserved) => JSON.stringify({
@@ -1192,9 +1236,12 @@ function scenarioRescueInterrupted() {
     rmSync(dirA, { recursive: true, force: true });
   }
 
-  // (b) committing 阶段中断:只能前滚为完整快照,旧事务材料随收尾移除。
+  // (b) committing 阶段中断(三个存储已换入):成功从未报告,只能收敛为完整
+  // 回退——还原救援前业务文件与旧事务材料,绝不前滚提交;回退后普通命令继续
+  // 拒绝(原损坏日志恢复到位),仍可再次显式救援。
   const dirB = makeDataDir();
   const dirC = makeDataDir();
+  const snapDirB = makeDataDir();
   try {
     write(join(dirB, 'r.csv'), 'device,time,reading\nm2,2026-01-05T00:00:00Z,5.000\n');
     let r = run(dirB, ['import', 'r.csv']);
@@ -1203,29 +1250,57 @@ function scenarioRescueInterrupted() {
     check(S, r.code === 0, `B rule rc=${r.code} ${r.err}`);
     r = run(dirB, ['group', 'configure', '--id', 'gb', '--at', '2026-01-01T00:00:00Z', '--device', 'm2']);
     check(S, r.code === 0, `B group rc=${r.code} ${r.err}`);
+    const snapB = join(snapDirB, 'snap.json');
+    r = run(dirB, ['backup', snapB]);
+    check(S, r.code === 0, `B backup rc=${r.code} ${r.err}`);
+
     write(join(dirC, 'r.csv'), 'device,time,reading\nx,2026-01-05T00:00:00Z,1.000\n');
     r = run(dirC, ['import', 'r.csv']);
     check(S, r.code === 0, `C import rc=${r.code} ${r.err}`);
-    // 损坏旧事务材料 + 提交中途的现场:新内容已在 *.rescue-new。
+    const preReadings = readFileSync(join(dirC, 'readings.json'), 'utf8');
+    // 损坏旧事务材料(救援前现场)。
     write(join(dirC, 'restore.journal'), 'corrupt');
     write(join(dirC, 'readings.json.restore-old'), 'junk');
-    for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
-      copyFileSync(join(dirB, n), join(dirC, `${n}.rescue-new`));
-    }
+    // 完整留存目录(真实救援在换入前已持久留存原始字节与缺失状态)。
     mkdirSync(join(dirC, 'rescue-preserved-1'));
-    write(join(dirC, 'rescue.journal'), mkJournal('committing', 'rescue-preserved-1', fixedRecord(dirC)));
+    const recC = fixedRecord(dirC);
+    for (const e of recC) {
+      if (e.hadOld) copyFileSync(join(dirC, e.name), join(dirC, 'rescue-preserved-1', e.name));
+    }
+    write(join(dirC, 'rescue-preserved-1', 'rescue-manifest.json'),
+      JSON.stringify({ format: 'meterwatch-rescue-manifest', version: 1, preserved: recC }, null, 2) + '\n');
+    // 提交中途的现场:三个存储已被换入为快照内容(救援新临时已不在)。
+    for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
+      copyFileSync(join(dirB, n), join(dirC, n));
+    }
+    write(join(dirC, 'rescue.journal'), mkJournal('committing', 'rescue-preserved-1', recC));
+
+    r = run(dirC, ['readings']);
+    check(S, r.code === 1 && /restore journal/.test(r.err) && !/device: m2/.test(r.out) && !/device: x/.test(r.out),
+      `B: interrupted commit must roll back, then the restored corrupt journal must refuse: rc=${r.code}\n${r.out}\n${r.err}`);
+    check(S, readFileSync(join(dirC, 'readings.json'), 'utf8') === preReadings,
+      'B: pre-rescue business bytes restored (snapshot not committed)');
+    check(S, readFileSync(join(dirC, 'restore.journal'), 'utf8') === 'corrupt' &&
+      readFileSync(join(dirC, 'readings.json.restore-old'), 'utf8') === 'junk',
+    'B: abandoned transaction materials restored in place');
+    check(S, !existsSync(join(dirC, 'rescue.journal')) && !existsSync(join(dirC, 'readings.json.rescue-new')),
+    'B: rescue journal and temps cleaned after rollback');
+    check(S, existsSync(join(dirC, 'rescue-preserved-1', 'readings.json')), 'B: preserved dir kept');
+    // 普通 restore 依旧不得绕过;显式救援仍可成功。
+    r = run(dirC, ['restore', snapB]);
+    check(S, r.code === 1 && /restore journal/.test(r.err),
+      `B: plain restore must still not bypass after rollback: rc=${r.code}`);
+    r = run(dirC, ['rescue', snapB]);
+    check(S, r.code === 0 && /rescued from snapshot/.test(r.out), `B: explicit rescue rc=${r.code} ${r.err}`);
     r = run(dirC, ['readings']);
     check(S, r.code === 0 && /device: m2/.test(r.out) && !/device: x/.test(r.out),
-      `B: interrupted commit must complete to the full snapshot:\n${r.out}\n${r.err}`);
-    check(S, !existsSync(join(dirC, 'rescue.journal')) && !existsSync(join(dirC, 'restore.journal')) &&
-      !existsSync(join(dirC, 'readings.json.restore-old')) && !existsSync(join(dirC, 'readings.json.rescue-new')),
-    'B: journals, temps and abandoned materials cleaned after commit');
-    check(S, existsSync(join(dirC, 'rescue-preserved-1')), 'B: preserved dir kept');
+      `B: snapshot state after explicit rescue:\n${r.out}`);
     r = run(dirC, ['rule', 'list']);
     check(S, r.code === 0 && /\bd1\b/.test(r.out), `B: rules from snapshot usable:\n${r.out}`);
   } finally {
     rmSync(dirB, { recursive: true, force: true });
     rmSync(dirC, { recursive: true, force: true });
+    rmSync(snapDirB, { recursive: true, force: true });
   }
 
   // (c) rolling-back 阶段中断:只能继续还原救援前状态;原损坏日志恢复到位后
@@ -1278,10 +1353,12 @@ function scenarioRescueInterrupted() {
   }
 }
 
-// R3:救援替换阶段受控失败 → 确定回退不得改向;回退受阻(文件锁定)时保留全部
-// 材料并阻止业务,故障排除后任一命令续接还原救援前状态,普通命令继续拒绝。
+// R3:救援替换阶段遇到真实 OS 故障(chflags 锁定业务文件,使换入删除失败)→
+// 返回 1、不输出成功结果,并回退到救援前状态;故障排除前普通命令继续被原损坏
+// 日志拒绝,排除后可再次显式救援。(回退受阻、跨进程保留材料的演练见 R4 的
+// 收尾故障钩子:被锁定的文件无法被换入,故 OS 锁本身不再阻塞回退。)
 function scenarioRescueFailureRollback() {
-  const S = 'R3 rescue commit failure rolls back; blocked rollback keeps materials';
+  const S = 'R3 rescue swap failure rolls back; corrupt journal still refuses';
   const dir = makeDataDir();
   const snapDir = makeDataDir();
   try {
@@ -1294,40 +1371,35 @@ function scenarioRescueFailureRollback() {
     const origReadings = readFileSync(join(dir, 'readings.json'), 'utf8');
     write(join(dir, 'restore.journal'), 'corrupt-journal');
 
-    // 可控本地故障:锁定业务文件,使替换与回滚的删除都失败。
+    // 可控本地故障:锁定业务文件,使换入阶段的删除失败(故障点在替换,不是锁)。
     const readingsPath = join(dir, 'readings.json');
     execFileSync('chflags', ['uchg', readingsPath]);
     try {
       r = run(dir, ['rescue', snap]);
-      check(S, r.code === 1 && /keeps all materials|keeps its rescue materials/.test(r.err),
-        `rescue with blocked rollback must fail rc=1 and keep materials: rc=${r.code} ${r.err}`);
-      // 材料全部保留:救援日志(rolling-back)、新临时、留存目录、原损坏日志。
-      const rj = readJson(dir, 'rescue.journal');
-      check(S, rj !== null && rj.phase === 'rolling-back',
-        `rescue journal must pin rolling-back (no direction change): ${JSON.stringify(rj)}`);
-      check(S, existsSync(join(dir, 'readings.json.rescue-new')), 'rescue temp kept');
-      check(S, existsSync(join(dir, 'rescue-preserved-1', 'readings.json')), 'preserved copy kept');
+      check(S, r.code === 1 && !/rescued from snapshot/.test(r.out) &&
+        /pre-rescue state restored/.test(r.err),
+        `rescue with a locked store must fail rc=1 with no success output and roll back: rc=${r.code} ${r.err}`);
+      // 同进程回退完成:业务字节未动,旧损坏日志保留,救援日志与新临时已清除,
+      // 留存目录保留。
+      check(S, readFileSync(readingsPath, 'utf8') === origReadings, 'business file untouched');
       check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'corrupt-journal',
         'old corrupt journal untouched');
-      check(S, readFileSync(readingsPath, 'utf8') === origReadings, 'business file untouched');
-      // 故障未排除时任一命令启动仍受阻,不开放混合库。
+      check(S, !existsSync(join(dir, 'rescue.journal')) &&
+        !existsSync(join(dir, 'readings.json.rescue-new')),
+      'rescue journal and temps cleaned after in-process rollback');
+      check(S, existsSync(join(dir, 'rescue-preserved-1', 'readings.json')), 'preserved copy kept');
+      // 故障未排除时:回退既已完成,阻塞业务的是恢复到位的原损坏日志(普通命令
+      // 与 restore 继续拒绝),不是残留的救援事务。
       r = run(dir, ['readings']);
-      check(S, r.code === 1 && /cannot complete interrupted rescue/.test(r.err),
-        `startup must stay blocked while rollback is stuck: rc=${r.code}`);
+      check(S, r.code === 1 && /restore journal/.test(r.err) && !/device: z/.test(r.out),
+        `startup refuses via the restored corrupt journal while the fault persists: rc=${r.code}`);
     } finally {
       execFileSync('chflags', ['nouchg', readingsPath]);
     }
-    // 故障排除后任一命令续接回退:还原救援前状态(含原损坏日志),普通命令继续拒绝。
+    // 故障排除后:普通命令仍被损坏日志拒绝;显式救援成功后业务可用。
     r = run(dir, ['readings']);
     check(S, r.code === 1 && /restore journal/.test(r.err),
-      `after rollback the restored corrupt journal keeps refusing: rc=${r.code}`);
-    check(S, readFileSync(readingsPath, 'utf8') === origReadings, 'pre-rescue business bytes restored');
-    check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'corrupt-journal',
-      'pre-rescue corrupt journal restored');
-    check(S, !existsSync(join(dir, 'rescue.journal')) && !existsSync(join(dir, 'readings.json.rescue-new')),
-      'rescue journal and temps cleaned after rollback');
-    check(S, existsSync(join(dir, 'rescue-preserved-1')), 'preserved materials survive rollback');
-    // 显式救援仍可用并成功。
+      `after the fault cleared the restored corrupt journal still refuses: rc=${r.code}`);
     r = run(dir, ['rescue', snap]);
     check(S, r.code === 0, `rescue after fault cleared rc=${r.code} ${r.err}`);
     r = run(dir, ['readings']);
@@ -1336,6 +1408,281 @@ function scenarioRescueFailureRollback() {
     try { execFileSync('chflags', ['nouchg', join(dir, 'readings.json')]); } catch { /* may not exist */ }
     rmSync(dir, { recursive: true, force: true });
     rmSync(snapDir, { recursive: true, force: true });
+  }
+}
+
+// R4:显式救援在「三个存储已换入后」的收尾阶段遇到可控读写失败——完成记录
+// (done)写入、事务材料清理、回退方向记录(rolling-back)写入——必须返回 1、
+// 不输出成功结果,并立即回退还原全部固定文件的字节与缺失状态;故障未排除时
+// 启动续接同样受阻或继续回退;解除故障后跨进程只能完成回退(即使日志停在
+// 提交/完成阶段也绝不提交快照);回退再次中断不改变方向、不误删已还原文件。
+// 另覆盖正常救援、留存完整与无关文件不变。
+function scenarioRescueTailFailures() {
+  const S = 'R4 rescue tail failures (done write / finalize cleanup / rollback-direction write)';
+
+  // 公共现场:业务库 + 损坏旧事务材料(含一个原本缺失的业务文件和一个无关文件)。
+  function setupSite() {
+    const dir = makeDataDir();
+    const snapDir = makeDataDir();
+    write(join(dir, 'r.csv'), ['device,time,reading',
+      'k,2026-01-05T00:00:00Z,10.000',
+      'k,2026-01-06T00:00:00Z,12.000',
+      '',
+    ].join('\n'));
+    let r = run(dir, ['import', 'r.csv']);
+    if (r.code !== 0) throw new Error(`setup import failed: ${r.err}`);
+    r = run(dir, ['correct', '--request', 'REQ-K',
+      '--item', '--device', 'k', '--at', '2026-01-06T00:00:00Z', '--expect', '12.000', '--set', '14.000']);
+    if (r.code !== 0) throw new Error(`setup correct failed: ${r.err}`);
+    r = run(dir, ['group', 'configure', '--id', 'gk', '--at', '2026-01-01T00:00:00Z', '--device', 'k']);
+    if (r.code !== 0) throw new Error(`setup group failed: ${r.err}`);
+    const snap = join(snapDir, 'snap.json');
+    r = run(dir, ['backup', snap]);
+    if (r.code !== 0) throw new Error(`setup backup failed: ${r.err}`);
+    // 救援前现场:业务存储与快照不同(readings/groups 为备份之后被改坏的字节;
+    // rescue 不解析当前库,这是合法救援输入),alerts.json 原本缺失。
+    write(join(dir, 'readings.json'), 'PRE-RESCUE-CORRUPT-READINGS\n');
+    write(join(dir, 'groups.json'), 'PRE-RESCUE-CORRUPT-GROUPS\n');
+    // 损坏旧事务材料。
+    write(join(dir, 'restore.journal'), 'CORRUPT-JOURNAL-BYTES\n');
+    write(join(dir, 'readings.json.restore-old'), 'OLD-BYTES\n');
+    write(join(dir, 'readings.json.restore-new'), 'NEW-BYTES\n');
+    write(join(dir, 'alerts.json.restore-old'), 'ALERT-OLD\n');
+    // 无关文件:救援任何阶段都不得改动。
+    write(join(dir, 'unrelated.txt'), 'keep-me\n');
+    write(join(dir, 'meterwatch.keep'), 'also-keep\n');
+    return { dir, snapDir, snap };
+  }
+
+  // 故障 1:完成记录(done)写入失败。
+  {
+    const { dir, snapDir, snap } = setupSite();
+    try {
+      const before = fixedRescueSnapshot(dir);
+      const unrelatedBefore = readFileSync(join(dir, 'unrelated.txt'));
+      const keepBefore = readFileSync(join(dir, 'meterwatch.keep'));
+      let r = runFault(dir, ['rescue', snap], 'rescue-done-write');
+      check(S, r.code === 1 && !/rescued from snapshot/.test(r.out),
+        `done-write failure must be rc=1 with no success output: rc=${r.code}\n${r.out}`);
+      check(S, /rollback|pre-rescue state restored/.test(r.err),
+        `done-write failure must roll back immediately: ${r.err}`);
+      // 同进程回退已成功:救援日志与新临时清除,全部固定文件还原为救援前字节。
+      check(S, sameFixedRescue(before, fixedRescueSnapshot(dir)) === null,
+        `done-write: all fixed files restored to pre-rescue bytes/existence (${sameFixedRescue(before, fixedRescueSnapshot(dir))})`);
+      check(S, !existsSync(join(dir, 'rescue.journal')), 'done-write: rescue journal removed after rollback');
+      check(S, existsSync(join(dir, 'rescue-preserved-1', 'readings.json')), 'done-write: preserved dir kept');
+      check(S, readFileSync(join(dir, 'unrelated.txt')).equals(unrelatedBefore) &&
+        readFileSync(join(dir, 'meterwatch.keep')).equals(keepBefore),
+      'done-write: unrelated files untouched');
+      // 跨进程:原损坏日志已恢复,普通命令继续拒绝;restore 不绕过;可再次救援。
+      r = run(dir, ['readings']);
+      check(S, r.code === 1 && /restore journal/.test(r.err) && !/device: k/.test(r.out),
+        `done-write: normal command refuses after rollback: rc=${r.code}`);
+      r = run(dir, ['rescue', snap]);
+      check(S, r.code === 0 && /rescued from snapshot/.test(r.out),
+        `done-write: explicit rescue still works afterward: rc=${r.code} ${r.err}`);
+      r = run(dir, ['readings']);
+      check(S, r.code === 0 && /14\.000/.test(r.out), `done-write: business equals snapshot after rescue:\n${r.out}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(snapDir, { recursive: true, force: true });
+    }
+  }
+
+  // 故障 2:收尾清理失败(删除旧事务材料),故障持续一次启动后再解除——跨进程
+  // 续接只能完成回退,绝不因日志处于 done(完成)阶段而提交快照。
+  {
+    const { dir, snapDir, snap } = setupSite();
+    try {
+      const before = fixedRescueSnapshot(dir);
+      let r = runFault(dir, ['rescue', snap], 'rescue-finalize-cleanup');
+      check(S, r.code === 1 && !/rescued from snapshot/.test(r.out),
+        `cleanup failure must be rc=1 with no success output: rc=${r.code}\n${r.out}`);
+      check(S, /rollback|pre-rescue state restored/.test(r.err),
+        `cleanup failure must roll back immediately: ${r.err}`);
+      // 同进程回退已完成:救援日志移除、固定文件还原(回退会把旧材料一并还原)。
+      check(S, sameFixedRescue(before, fixedRescueSnapshot(dir)) === null,
+        `cleanup: all fixed files restored (${sameFixedRescue(before, fixedRescueSnapshot(dir))})`);
+      check(S, !existsSync(join(dir, 'rescue.journal')), 'cleanup: rescue journal removed after rollback');
+      // 演练「日志停在完成阶段」的跨现场:手工构造 done 日志且三个存储为快照内容,
+      // 留存齐全(等同故障发生在清理与方向翻转之间被杀)。重启必须回退,不得提交。
+      const pres = join(dir, 'rescue-preserved-2');
+      mkdirSync(pres);
+      const rec = FIXED_RESCUE_NAMES.map((name) => ({ name, hadOld: before[name].exists }));
+      for (const e of rec) if (e.hadOld) copyFileSync(join(dir, e.name), join(pres, e.name));
+      write(join(pres, 'rescue-manifest.json'),
+        JSON.stringify({ format: 'meterwatch-rescue-manifest', version: 1, preserved: rec }, null, 2) + '\n');
+      // 用一次真实救援把快照安装到全新探测目录,取回三个存储的落地字节(等价
+      // 于本次救援换入后的业务文件内容),再覆盖到现场。
+      const probe = makeDataDir();
+      try {
+        const rr = run(probe, ['rescue', snap]);
+        check(S, rr.code === 0, `probe rescue for snapshot bytes rc=${rr.code} ${rr.err}`);
+        for (const n of ['readings.json', 'alerts.json', 'groups.json']) {
+          if (existsSync(join(probe, n))) copyFileSync(join(probe, n), join(dir, n));
+          else if (existsSync(join(dir, n))) rmSync(join(dir, n));
+        }
+      } finally {
+        rmSync(probe, { recursive: true, force: true });
+      }
+      write(join(dir, 'rescue.journal'), JSON.stringify({
+        format: 'meterwatch-rescue-journal', version: 1, phase: 'done',
+        preservedDir: 'rescue-preserved-2',
+        stores: ['readings.json', 'alerts.json', 'groups.json'], preserved: rec,
+      }, null, 2) + '\n');
+      r = run(dir, ['--help']);
+      check(S, r.code === 1 && !/建筑能耗监测/.test(r.out) && /rolling back/.test(r.err),
+        `done-phase journal on startup must roll back, not commit (even --help is blocked): rc=${r.code}\n${r.err}`);
+      check(S, sameFixedRescue(before, fixedRescueSnapshot(dir)) === null,
+        `done-phase: cross-process rollback restored every fixed file (${sameFixedRescue(before, fixedRescueSnapshot(dir))})`);
+      check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'CORRUPT-JOURNAL-BYTES\n',
+        'done-phase: corrupt restore journal restored in place');
+      r = run(dir, ['readings']);
+      check(S, r.code === 1 && /restore journal/.test(r.err), 'done-phase: normal command refuses again');
+      // 显式救援成功后整库等于快照。
+      r = run(dir, ['rescue', snap]);
+      check(S, r.code === 0, `cleanup: final explicit rescue rc=${r.code} ${r.err}`);
+      r = run(dir, ['correct', '--request', 'REQ-K',
+        '--item', '--device', 'k', '--at', '2026-01-06T00:00:00Z', '--expect', '12.000', '--set', '14.000']);
+      check(S, r.code === 0 && /committed: 1 item\(s\), 1 reading\(s\) changed/.test(r.out),
+        `cleanup: correction history replay usable after rescue:\n${r.out}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(snapDir, { recursive: true, force: true });
+    }
+  }
+
+  // 故障 3:回退方向记录(rolling-back)写入失败——换入成功、done 写入也成功
+  // (日志停在完成阶段),清理时注入方向翻转失败:材料保留、业务被阻止;故障
+  // 持续时任一入口都不能提交;解除后只能完成回退。
+  {
+    const { dir, snapDir, snap } = setupSite();
+    try {
+      const before = fixedRescueSnapshot(dir);
+      // 同时注入 done 写入?不需要:方向记录在收尾失败后的回退路径里写。
+      // 流程:换入成功 -> done 写入成功 -> 清理删除首个旧材料失败 -> 尝试写
+      // rolling-back 失败(注入)=> 抛错、返回 1,日志停在 done,材料全保留。
+      let r = runFault(dir, ['rescue', snap], 'rescue-finalize-cleanup,rescue-rollback-write');
+      check(S, r.code === 1 && !/rescued from snapshot/.test(r.out),
+        `cleanup+direction failure must be rc=1 with no success output: rc=${r.code}\n${r.out}`);
+      check(S, /rollback .*could not (start|finish)|materials needed/.test(r.err),
+        `blocked rollback direction write must keep materials: ${r.err}`);
+      const j = readJson(dir, 'rescue.journal');
+      check(S, j !== null && j.phase === 'done',
+        `journal stays at done when the rollback-direction write fails: ${JSON.stringify(j)}`);
+      check(S, existsSync(join(dir, 'rescue-preserved-1', 'readings.json')) &&
+        existsSync(join(dir, 'readings.json.restore-old')),
+      'direction-write failure: preserved materials and old transaction materials kept');
+      // 故障未排除时再启动:仍只能尝试回退(翻转仍失败)=> 返回 1,业务被阻止,
+      // 绝不因日志处于完成阶段而提交快照。
+      r = runFault(dir, ['readings'], 'rescue-rollback-write');
+      check(S, r.code === 1 && /cannot complete interrupted rescue/.test(r.err) && !/device: k/.test(r.out),
+        `startup stays blocked while direction write fails: rc=${r.code}`);
+      check(S, readJson(dir, 'rescue.journal')?.phase === 'done', 'journal still at done; snapshot never committed');
+      // 解除故障:跨进程续接只能完成回退(全部固定文件还原),之后普通命令拒绝。
+      r = run(dir, ['rule', 'list']);
+      check(S, r.code === 1 && /restore journal/.test(r.err) && !/gk|nr/.test(r.out),
+        `after fault cleared only rollback completes, then normal commands refuse: rc=${r.code}`);
+      check(S, sameFixedRescue(before, fixedRescueSnapshot(dir)) === null,
+        `direction-write: all fixed files restored after fault cleared (${sameFixedRescue(before, fixedRescueSnapshot(dir))})`);
+      check(S, readFileSync(join(dir, 'restore.journal'), 'utf8') === 'CORRUPT-JOURNAL-BYTES\n',
+        'direction-write: corrupt journal restored');
+      check(S, !existsSync(join(dir, 'rescue.journal')), 'direction-write: rescue journal removed');
+      check(S, existsSync(join(dir, 'rescue-preserved-1')), 'direction-write: preserved dir kept');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(snapDir, { recursive: true, force: true });
+    }
+  }
+
+  // 故障 4:回退再次中断(回退还原第一个留存文件后失败)——方向已钉死为
+  // rolling-back;重试不得改变方向、不误删已还原文件(原位字节已与留存一致时
+  // 保持不动,不再删除重建);续接收敛为完整救援前状态。
+  {
+    const { dir, snapDir, snap } = setupSite();
+    try {
+      const before = fixedRescueSnapshot(dir);
+      let r = runFault(dir, ['rescue', snap], 'rescue-finalize-cleanup,rescue-rollback-pass');
+      check(S, r.code === 1 && !/rescued from snapshot/.test(r.out),
+        `rollback re-interruption must be rc=1: rc=${r.code}\n${r.out}`);
+      const j = readJson(dir, 'rescue.journal');
+      check(S, j !== null && j.phase === 'rolling-back',
+        `direction pinned to rolling-back before the pass: ${JSON.stringify(j)}`);
+      // 部分还原:第一个留存文件(readings.json)已还原,其余尚未(快照换入后
+      // 新建的 alerts.json 与被换入覆盖的 groups.json 等仍待处理);已还原文件在位。
+      check(S, readFileSync(join(dir, 'readings.json'), 'utf8') === before['readings.json'].raw.toString('utf8'),
+        're-interrupt: first restored file already back in place');
+      check(S, existsSync(join(dir, 'alerts.json')), 're-interrupt: stores created by the swap still pending removal');
+      // 第二次运行仍带故障:readings.json 字节已与留存一致 => 跳过、不误删;
+      // 回退继续处理后续固定文件并在第一个还原动作后再次中断(回退过程中再次
+      // 中断)。仍返回 1,方向保持 rolling-back,已还原文件不丢。
+      r = runFault(dir, ['readings'], 'rescue-rollback-pass');
+      check(S, r.code === 1 && /cannot complete interrupted rescue/.test(r.err),
+        `re-interrupted rollback retry stays rc=1: rc=${r.code}`);
+      check(S, readJson(dir, 'rescue.journal')?.phase === 'rolling-back', 're-interrupt does not change direction');
+      check(S, readFileSync(join(dir, 'readings.json'), 'utf8') === before['readings.json'].raw.toString('utf8'),
+        'retry: already-restored readings file was not deleted or reverted');
+      // 解除故障后第三次运行:续接完成全部回退——删除原本缺失而被换入创建的
+      // alerts.json,逐项还原其余旧材料(含被改坏的 groups.json 字节)与缺失状态;
+      // 随后恢复到位的损坏日志继续拒绝业务。
+      r = run(dir, ['readings']);
+      check(S, r.code === 1 && /restore journal/.test(r.err) && !/device: k/.test(r.out),
+        `rollback completion then restores corrupt-journal refusal: rc=${r.code}\n${r.out}`);
+      check(S, !existsSync(join(dir, 'alerts.json')),
+        'retry: originally-absent alerts store restored to absent');
+      check(S, readFileSync(join(dir, 'groups.json'), 'utf8') === 'PRE-RESCUE-CORRUPT-GROUPS\n',
+        'retry: pre-rescue groups bytes restored');
+      check(S, sameFixedRescue(before, fixedRescueSnapshot(dir)) === null,
+        `re-interrupt: every fixed file restored to pre-rescue state (${sameFixedRescue(before, fixedRescueSnapshot(dir))})`);
+      check(S, !existsSync(join(dir, 'rescue.journal')) &&
+        !existsSync(join(dir, 'readings.json.rescue-new')),
+      're-interrupt: rescue journal and temps cleaned');
+      // 再重试:状态稳定,依旧被损坏日志拒绝,材料不被重复改动;显式救援可用。
+      const stable = fixedRescueSnapshot(dir);
+      r = run(dir, ['rule', 'list']);
+      check(S, r.code === 1 && /restore journal/.test(r.err), `stable state keeps refusing: rc=${r.code}`);
+      check(S, sameFixedRescue(stable, fixedRescueSnapshot(dir)) === null, 'further retries change nothing');
+      r = run(dir, ['rescue', snap]);
+      check(S, r.code === 0 && /rescued from snapshot/.test(r.out),
+        `re-interrupt: explicit rescue still succeeds: rc=${r.code} ${r.err}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(snapDir, { recursive: true, force: true });
+    }
+  }
+
+  // 对照:无故障注入(环境变量不设置)时救援正常成功,留存完整、无关文件不变。
+  {
+    const { dir, snapDir, snap } = setupSite();
+    try {
+      const preUnrelated = readFileSync(join(dir, 'unrelated.txt'));
+      let r = run(dir, ['rescue', snap]);
+      check(S, r.code === 0 && /rescued from snapshot/.test(r.out) &&
+        /rescue-preserved-1/.test(r.out), `normal rescue rc=${r.code} ${r.err}`);
+      check(S, readFileSync(join(dir, 'unrelated.txt')).equals(preUnrelated),
+        'normal rescue: unrelated file bytes untouched');
+      check(S, existsSync(join(dir, 'rescue-preserved-1', 'rescue-manifest.json')) &&
+        readFileSync(join(dir, 'rescue-preserved-1', 'restore.journal'), 'utf8') === 'CORRUPT-JOURNAL-BYTES\n' &&
+        readFileSync(join(dir, 'rescue-preserved-1', 'readings.json.restore-old'), 'utf8') === 'OLD-BYTES\n',
+      'normal rescue: preservation keeps raw bytes of stores and transaction materials');
+      check(S, !existsSync(join(dir, 'rescue-preserved-1', 'alerts.json')),
+        'normal rescue: originally-missing store (alerts.json) preserved as absent');
+      check(S, !existsSync(join(dir, 'restore.journal')) &&
+        !existsSync(join(dir, 'readings.json.restore-old')) &&
+        !existsSync(join(dir, 'readings.json.restore-new')),
+      'normal rescue: abandoned materials removed from live locations');
+      // 整库等于快照:精确读数、修正撤销历史、分组、告警历史可用;不自动评估。
+      r = run(dir, ['readings']);
+      check(S, r.code === 0 && /device: k/.test(r.out) && /14\.000/.test(r.out),
+        `normal rescue: exact readings available:\n${r.out}`);
+      r = run(dir, ['corrections']);
+      check(S, r.code === 0 && /REQ-K/.test(r.out), `normal rescue: correction history available:\n${r.out}`);
+      r = run(dir, ['group', 'history', '--id', 'gk']);
+      check(S, r.code === 0 && /gk/.test(r.out), `normal rescue: group history available:\n${r.out}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(snapDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1355,6 +1702,7 @@ const scenarios = [
   scenarioRescue,
   scenarioRescueInterrupted,
   scenarioRescueFailureRollback,
+  scenarioRescueTailFailures,
 ];
 
 for (const sc of scenarios) {

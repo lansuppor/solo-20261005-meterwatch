@@ -31,8 +31,14 @@
 //   状态持久留存到 rescue-preserved-<序号>/ 并报告位置(留存不完整绝不
 //   替换;留存材料不被启动或后续恢复自动清理),再把三个存储整体替换为
 //   校验过的快照。救援自身用 rescue.journal 记录阶段(preserving →
-//   committing → rolling-back → done),被中断后任一命令启动先续接为完整
-//   快照或完整退回救援前状态,绝不开放混合库;确定回退后不得改向。
+//   committing → rolling-back → done)。从开始换入到报告成功前,任何读写、
+//   重命名或删除失败(含三个存储已换入后的完成状态写入与旧事务材料清理
+//   失败)都返回 1、不输出成功结果,并确定回退:幂等还原救援前全部文件的
+//   原始字节与缺失状态。回退方向一旦确定不得改向;即使方向记录本身写入
+//   失败,重启续接见到 committing/done 也只能完成回退(直接中断可收敛为
+//   完整快照或完整救援前状态,故统一收敛为回退),绝不替未成功报告的救援
+//   前滚提交。成功完成的唯一标志是救援日志已移除。回退受阻时保留全部材料
+//   并阻止业务;回退还原原损坏日志后普通命令继续拒绝,仍可再次显式救援。
 
 import { createHash } from 'node:crypto';
 import {
@@ -84,6 +90,24 @@ const RESCUE_JOURNAL_FORMAT = 'meterwatch-rescue-journal';
 const RESCUE_NEW_SUFFIX = '.rescue-new';
 const PRESERVED_PREFIX = 'rescue-preserved-';
 const RESCUE_MANIFEST_NAME = 'rescue-manifest.json';
+
+/**
+ * 离线回归测试用的可控故障点(无外部运行依赖):仅当设置了环境变量
+ * METERWATCH_TEST_FAULT(逗号分隔)时生效;不设置时完全没有行为,正常使用
+ * 不受影响。用于在跨进程演练中精确命中特定读写点:
+ *  - rescue-done-write:三个存储换入后写完成记录(done)失败;
+ *  - rescue-finalize-cleanup:救援收尾删除旧事务材料失败;
+ *  - rescue-rollback-write:回退方向记录(rolling-back)写入失败;
+ *  - rescue-rollback-pass:回退还原完第一个业务存储后失败(模拟回退再次中断)。
+ */
+function testFaults(): Set<string> {
+  return new Set(
+    (process.env.METERWATCH_TEST_FAULT ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+}
 
 /** 恢复阶段;阶段只能按声明的顺序推进,字段缺失按最保守的 committing 处理。 */
 type RestorePhase = 'preparing' | 'committing' | 'rolling-back' | 'done';
@@ -568,6 +592,17 @@ function parseRescueJournal(data: unknown): RescueJournal | null {
 
 /** 原子改写救援日志阶段(先写临时文件再换名)。失败抛错,材料保留。 */
 function writeRescueJournalPhase(dir: string, journal: RescueJournal, phase: RescuePhase): void {
+  // 测试故障点:完成记录(done)/回退方向记录(rolling-back)写入失败。
+  const faultKey = phase === 'done'
+    ? 'rescue-done-write'
+    : phase === 'rolling-back'
+      ? 'rescue-rollback-write'
+      : null;
+  if (faultKey !== null && testFaults().has(faultKey)) {
+    const e = new Error(`injected test fault: cannot write rescue journal phase ${phase}`);
+    (e as NodeJS.ErrnoException).code = 'EIO';
+    throw e;
+  }
   const journalPath = join(dir, RESCUE_JOURNAL_NAME);
   const tmp = `${journalPath}.tmp-${process.pid}`;
   writeFileSync(
@@ -636,10 +671,20 @@ function rescueCommitCleanup(dir: string, journal: RescueJournal): void {
       throw new StoreError(`rescue temp file ${newPath} still present; commit is incomplete`);
     }
   }
+  let cleanupFaultUsed = false;
   for (const entry of journal.preserved) {
     if (entry.name === JOURNAL_NAME || entry.name.endsWith(OLD_SUFFIX) || entry.name.endsWith(NEW_SUFFIX)) {
       const p = join(dir, entry.name);
-      if (existsSync(p)) rmSync(p);
+      if (existsSync(p)) {
+        // 测试故障点:收尾删除第一个旧事务材料时失败(模拟收尾读写失败)。
+        if (!cleanupFaultUsed && testFaults().has('rescue-finalize-cleanup')) {
+          cleanupFaultUsed = true;
+          const e = new Error('injected test fault: cannot remove abandoned restore material');
+          (e as NodeJS.ErrnoException).code = 'EIO';
+          throw e;
+        }
+        rmSync(p);
+      }
     }
   }
   rmSync(join(dir, RESCUE_JOURNAL_NAME));
@@ -652,6 +697,17 @@ function rescueCommitCleanup(dir: string, journal: RescueJournal): void {
  */
 function rescueRollbackPass(dir: string, journal: RescueJournal): void {
   const preservedDir = join(dir, journal.preservedDir);
+  let actionCount = 0;
+  const interruptPoint = () => {
+    actionCount++;
+    // 测试故障点:每轮回退完成第一个还原动作(复制回原文件,或删除原本缺失而
+    // 被换入创建的文件)后中断,用于演练回退再次中断后续接。
+    if (actionCount === 1 && testFaults().has('rescue-rollback-pass')) {
+      const e = new Error('injected test fault: interrupted during rescue rollback');
+      (e as NodeJS.ErrnoException).code = 'EIO';
+      throw e;
+    }
+  };
   for (const entry of journal.preserved) {
     const live = join(dir, entry.name);
     const kept = join(preservedDir, entry.name);
@@ -661,13 +717,17 @@ function rescueRollbackPass(dir: string, journal: RescueJournal): void {
           `cannot restore pre-rescue ${live}: preserved copy ${kept} is missing or not a regular file`,
         );
       }
-      if (existsSync(live)) {
-        if (!isRegularFile(live)) {
-          throw new StoreError(`cannot restore pre-rescue ${live}: live path exists but is not a regular file`);
+      if (isRegularFile(live)) {
+        // 已还原到位(原位字节与留存一致):重试时保持不动,绝不误删。
+        if (readFileSync(live).equals(readFileSync(kept))) {
+          continue;
         }
         rmSync(live);
+      } else if (existsSync(live)) {
+        throw new StoreError(`cannot restore pre-rescue ${live}: live path exists but is not a regular file`);
       }
       copyFileSync(kept, live);
+      interruptPoint();
     } else {
       if (existsSync(kept)) {
         throw new StoreError(
@@ -679,6 +739,7 @@ function rescueRollbackPass(dir: string, journal: RescueJournal): void {
           throw new StoreError(`cannot restore missing state for ${live}: live path is not a regular file`);
         }
         rmSync(live);
+        interruptPoint();
       }
     }
   }
@@ -691,12 +752,33 @@ function rescueRollbackCleanup(dir: string, journal: RescueJournal): void {
 }
 
 /**
- * 续接被中断的救援(持锁调用)。依据救援日志阶段决定方向:
- * - preserving:替换尚未开始,退回救援前状态(删新临时与救援日志,留存保留)。
- * - committing/done:只能前滚为完整快照。
- * - rolling-back:只能继续还原救援前状态,不得改向。
- * 无救援日志时清理可能残留的救援临时文件。成功(或无需续接)返回 null;
- * 无法可靠判定或完成时返回错误消息,材料一律保留。
+ * 完成一次已确定方向的救援回退:先在日志中钉死 rolling-back(此后方向不得
+ * 改变;重启续接见到 rolling-back 或未能翻转方向而留下的 committing 都只
+ * 能继续回退),再幂等还原救援前全部文件的字节与缺失状态,最后清理新临时
+ * 与救援日志。任一步失败抛错并保留全部材料,不猜测、不改向。
+ */
+function rescueFinalizeRollback(dir: string, journal: RescueJournal): void {
+  if (journal.phase !== 'rolling-back') {
+    writeRescueJournalPhase(dir, journal, 'rolling-back');
+  }
+  rescueRollbackPass(dir, journal);
+  rescueRollbackCleanup(dir, journal);
+}
+
+/**
+ * 续接被中断的救援(持锁调用)。救援成功完成的标志是救援日志已移除;日志仍在
+ * 说明成功从未向使用者报告,一律不得把快照提交给业务:
+ * - preserving:替换尚未开始(留存可能不完整),放弃本次救援:删新临时与救援
+ *   日志,留存目录保留,业务状态即救援前状态。
+ * - committing/done:换入已经开始但成功从未报告。可能是直接中断,也可能是收尾
+ *   读写失败后已决定回退、却在方向记录(rolling-back)写入时失败或被杀——两种
+ *   情形无法区分;即使日志停在提交或完成阶段也绝不前滚提交,统一收敛为回退,
+ *   幂等还原救援前全部文件的原始字节与缺失状态(done 仅旧版本会写出)。
+ * - rolling-back:回退方向已钉死,只能继续还原救援前状态;回退幂等,再次中断
+ *   或重试不改变方向、不误删已还原文件。
+ * 回退完成后原损坏日志恢复到位,由调用方继续按普通恢复规则判定(普通命令继续
+ * 拒绝,仍可再次显式救援)。无救援日志时清理可能残留的救援临时文件。成功(或
+ * 无需续接)返回 null;无法可靠判定或完成时返回错误消息,材料一律保留。
  */
 function continueInterruptedRescue(dir: string): string | null {
   const journalPath = join(dir, RESCUE_JOURNAL_NAME);
@@ -744,18 +826,19 @@ function continueInterruptedRescue(dir: string): string | null {
       err('abandoned an interrupted rescue before any replacement: pre-rescue state kept');
       return null;
     }
-    if (journal.phase === 'committing' || journal.phase === 'done') {
-      if (journal.phase === 'committing') {
-        rescueRollForwardPass(dir, journal);
-        writeRescueJournalPhase(dir, journal, 'done');
-      }
-      rescueCommitCleanup(dir, journal);
-      err('completed an interrupted rescue: snapshot state committed');
-      return null;
+    if (journal.phase === 'done') {
+      // 完成记录已写但成功从未报告(典型:随后的事务材料清理失败,或回退方向
+      // 记录写入失败)。停在完成阶段同样不得前滚提交,与 committing 一并收敛
+      // 为回退。
+      err('found an interrupted rescue journal past the swap but success was never reported: rolling back');
+    } else if (journal.phase === 'committing') {
+      // 成功从未报告:直接中断,或收尾失败后方向记录(rolling-back)写入失败,
+      // 在此无法区分——统一收敛为回退,绝不替未成功的救援前滚提交。
+      err('continued an interrupted rescue before success was reported: rolling back to the pre-rescue state');
     }
-    // rolling-back:确定回退后只能继续还原救援前状态。
-    rescueRollbackPass(dir, journal);
-    rescueRollbackCleanup(dir, journal);
+    // committing/done(按上)与 rolling-back:确定回退后只能继续还原救援前状态,
+    // 不得改向;回退幂等,再次中断或重试不改变方向、不误删已还原文件。
+    rescueFinalizeRollback(dir, journal);
     err('continued an interrupted rescue rollback: pre-rescue state restored');
     return null;
   } catch (e) {
@@ -779,7 +862,11 @@ function continueInterruptedRescue(dir: string): string | null {
  *     历史)。留存不完整绝不替换。
  *  3. committing:整体换入新内容。受控失败先置 rolling-back(此后只能还原
  *     救援前状态,不得改向),再幂等回滚。
- *  4. 成功:置 done,移除活动位置的旧事务材料与救援日志;留存目录保留。
+ *  4. 成功报告前的收尾:三个存储已换入后,移除活动位置的旧事务材料并删除
+ *     救援日志。此阶段任何读写、重命名或删除失败与换入失败同等处理:返回 1、
+ *     不输出成功结果,确定回退并幂等还原救援前全部文件(回退受阻则保留全部
+ *     材料并阻止业务;重启续接见 continueInterruptedRescue)。全部收尾完成后
+ *     才向调用方返回,由其报告成功。
  * 返回留存目录名(供报告)。
  */
 function performRescue(dir: string, files: Array<{ path: string; body: string }>): string {
@@ -862,36 +949,57 @@ function performRescue(dir: string, files: Array<{ path: string; body: string }>
   } catch (e) {
     // 受控失败:确定回退后不得改向;回滚幂等,可中断续接。
     try {
-      writeRescueJournalPhase(dir, journal, 'rolling-back');
-    } catch (we) {
-      throw new StoreError(
-        `rescue failed (${(e as Error).message}) and the rollback could not be started ` +
-          `(${(we as Error).message}); data directory ${dir} keeps its rescue materials - ` +
-          `run any meterwatch command again to continue the rollback`,
-      );
-    }
-    try {
-      rescueRollbackPass(dir, journal);
-      rescueRollbackCleanup(dir, journal);
+      rescueFinalizeRollback(dir, journal);
     } catch (re) {
+      const state = journal.phase === 'rolling-back' ? 'is in progress and could not finish' : 'could not be started';
       throw new StoreError(
-        `rescue failed (${(e as Error).message}); rollback is in progress and could not finish ` +
+        `rescue failed (${(e as Error).message}); rollback ${state} ` +
           `(${(re as Error).message}); data directory ${dir} keeps all materials needed to restore ` +
-          `the pre-rescue state - run any meterwatch command again to finish it`,
+          `the pre-rescue state - run any meterwatch command again to finish the rollback`,
       );
     }
     throw new StoreError(`rescue failed: ${(e as Error).message}; pre-rescue state restored`);
   }
 
-  // 阶段四:提交已落地,记录完成并收尾。收尾失败不影响快照一致性,下次启动
-  // 会完成清理。
+  // 阶段四:三个存储已换入,但成功尚未报告。先写完成记录(done),再移除活动
+  // 位置的旧事务材料并删除救援日志。从换入开始到报告成功前的任何读写、重命名
+  // 或删除失败——包括完成状态写入与事务材料清理失败——都与换入失败同等处理:
+  // 返回 1、不输出成功结果,确定回退并幂等还原救援前全部文件;即使失败时日志
+  // 停在提交(committing)或完成(done)阶段,重启续接也只能完成回退,绝不前滚
+  // 提交。回退受阻则保留全部材料、阻止业务。只有全部收尾完成(救援日志移除)
+  // 后才由调用方报告成功(返回 0)。
   try {
     writeRescueJournalPhase(dir, journal, 'done');
+  } catch (e) {
+    try {
+      rescueFinalizeRollback(dir, journal);
+    } catch (re) {
+      const state = journal.phase === 'rolling-back' ? 'is in progress and could not finish' : 'could not be started';
+      throw new StoreError(
+        `rescue failed after the stores were swapped in (${(e as Error).message}); rollback ${state} ` +
+          `(${(re as Error).message}); data directory ${dir} keeps all materials needed to restore ` +
+          `the pre-rescue state - run any meterwatch command again to finish the rollback`,
+      );
+    }
+    throw new StoreError(
+      `rescue failed after the stores were swapped in: ${(e as Error).message}; pre-rescue state restored`,
+    );
+  }
+  try {
     rescueCommitCleanup(dir, journal);
   } catch (e) {
+    try {
+      rescueFinalizeRollback(dir, journal);
+    } catch (re) {
+      const state = journal.phase === 'rolling-back' ? 'is in progress and could not finish' : 'could not be started';
+      throw new StoreError(
+        `rescue failed after the stores were swapped in (${(e as Error).message}); rollback ${state} ` +
+          `(${(re as Error).message}); data directory ${dir} keeps all materials needed to restore ` +
+          `the pre-rescue state - run any meterwatch command again to finish the rollback`,
+      );
+    }
     throw new StoreError(
-      `snapshot state was committed but post-rescue cleanup failed: ${(e as Error).message}; ` +
-        `run any meterwatch command again to finish cleanup`,
+      `rescue failed after the stores were swapped in: ${(e as Error).message}; pre-rescue state restored`,
     );
   }
   return preservedDir;
