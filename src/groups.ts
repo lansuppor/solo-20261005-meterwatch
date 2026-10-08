@@ -251,19 +251,14 @@ export interface GroupSegmentStats {
 }
 
 /**
- * 计算分组在 [segStart, segEnd) 上的覆盖与消耗。
- * versions 按生效时刻升序;seriesByDevice 含全部版本成员的完整时序。
- * maxInterval 为可选的最大采样间隔限制(秒),按完整已存时序的相邻读数
- * 实际时间差判定,等于限制仍可信。
+ * 按版本生效时刻把 [segStart, segEnd) 切成成员恒定的时段;首个版本生效前
+ * members 为 null。versions 需按生效时刻升序。
  */
-export function computeGroupSegment(
+export function buildGroupPeriods(
   versions: GroupVersion[],
-  seriesByDevice: Map<string, Reading[]>,
   segStart: number,
   segEnd: number,
-  maxInterval?: number,
-): GroupSegmentStats {
-  // 按版本生效时刻把段切成成员恒定的时段;首个版本生效前 members 为 null。
+): GroupPeriod[] {
   const periods: GroupPeriod[] = [];
   let idx = -1;
   for (let i = 0; i < versions.length; i++) {
@@ -278,20 +273,55 @@ export function computeGroupSegment(
     cursor = pEnd;
     idx++;
   }
+  return periods;
+}
 
-  let valid = 0;
-  let anomaly = 0;
-  let unknown = 0;
-  let gapUnknown = 0;
-  const gaps: GapDetail[] = [];
-  let consumption = 0n;
-  for (const p of periods) {
+export interface GroupStateSlice {
+  /** 切片起点(含),epoch 秒。 */
+  start: number;
+  /** 切片终点(不含),epoch 秒。 */
+  end: number;
+  /** 联合覆盖状态:任一成员下降优先为 anomaly,否则任一成员未知为 unknown,全部可信才 valid。 */
+  kind: SliceKind;
+  /** valid 切片内全部生效成员的分摊消耗之和(毫千瓦时 BigInt);其余为 0。 */
+  consumption: bigint;
+  /** 该切片生效成员;null 表示首个版本生效前。 */
+  members: string[] | null;
+  /** unknown 且由成员过长相邻区间造成时的原始区间明细(设备与原始相邻读数时刻)。 */
+  gaps: GapDetail[];
+}
+
+/**
+ * 分组在 [segStart, segEnd) 上的最细状态时间线:先按版本生效时刻切成成员
+ * 恒定时段,再按各成员落在时段内的读数时刻细切,故每个切片内每个成员的
+ * 状态恒定。口径与 computeGroupSegment 完全一致(任一成员下降优先为异常,
+ * 否则任一成员未知为未知,全部可信才有效;过长间隔按原始相邻区间判定)。
+ * 供需要在额外切点(如两期对齐边界)上重切的调用方使用:成员切换与额外
+ * 切点都不重置各设备原读数区间的分摊起点。
+ */
+export function groupStateTimeline(
+  versions: GroupVersion[],
+  seriesByDevice: Map<string, Reading[]>,
+  segStart: number,
+  segEnd: number,
+  maxInterval?: number,
+  extraCuts?: readonly number[],
+): GroupStateSlice[] {
+  const slices: GroupStateSlice[] = [];
+  for (const p of buildGroupPeriods(versions, segStart, segEnd)) {
     if (p.members === null) {
-      unknown += p.end - p.start;
+      slices.push({ start: p.start, end: p.end, kind: 'unknown', consumption: 0n, members: null, gaps: [] });
       continue;
     }
     // 切点:时段边界与全部成员的读数时刻;相邻切点间每个成员的状态恒定。
+    // extraCuts 为调用方附加的绝对时刻切点(如两期对齐边界),只细切不改变
+    // 任何口径:分摊仍以原读数区间起点累计,不被这些切点重置。
     const bounds = new Set<number>([p.start, p.end]);
+    if (extraCuts) {
+      for (const c of extraCuts) {
+        if (c > p.start && c < p.end) bounds.add(c);
+      }
+    }
     for (const m of p.members) {
       for (const r of seriesByDevice.get(m) ?? []) {
         if (r.ts > p.start && r.ts < p.end) bounds.add(r.ts);
@@ -313,23 +343,66 @@ export function computeGroupSegment(
           if (res.gap) sliceGaps.push({ device: m, start: res.gap.start, end: res.gap.end });
         } else slice += res.consumption;
       }
-      if (anyAnomaly) {
-        anomaly += e - s;
-      } else if (anyUnknown) {
-        unknown += e - s;
-        // 过长间隔未知只在最终未知时段内按实际时间计并集:同一子片段内
-        // 任一成员有过长区间即计一次,不叠加成员秒数。
-        if (sliceGaps.length > 0) {
-          gapUnknown += e - s;
-          mergeGaps(gaps, sliceGaps);
-        }
-      } else {
-        valid += e - s;
-        consumption += slice;
-      }
+      const kind: SliceKind = anyAnomaly ? 'anomaly' : anyUnknown ? 'unknown' : 'valid';
+      slices.push({
+        start: s,
+        end: e,
+        kind,
+        consumption: kind === 'valid' ? slice : 0n,
+        members: p.members,
+        gaps: kind === 'unknown' ? sliceGaps : [],
+      });
     }
   }
-  return { valid, anomaly, unknown, gapUnknown, gaps, consumption, periods };
+  return slices;
+}
+
+/**
+ * 计算分组在 [segStart, segEnd) 上的覆盖与消耗。
+ * versions 按生效时刻升序;seriesByDevice 含全部版本成员的完整时序。
+ * maxInterval 为可选的最大采样间隔限制(秒),按完整已存时序的相邻读数
+ * 实际时间差判定,等于限制仍可信。
+ */
+export function computeGroupSegment(
+  versions: GroupVersion[],
+  seriesByDevice: Map<string, Reading[]>,
+  segStart: number,
+  segEnd: number,
+  maxInterval?: number,
+): GroupSegmentStats {
+  let valid = 0;
+  let anomaly = 0;
+  let unknown = 0;
+  let gapUnknown = 0;
+  const gaps: GapDetail[] = [];
+  let consumption = 0n;
+  const slices = groupStateTimeline(versions, seriesByDevice, segStart, segEnd, maxInterval);
+  for (const sl of slices) {
+    const secs = sl.end - sl.start;
+    if (sl.kind === 'anomaly') {
+      anomaly += secs;
+    } else if (sl.kind === 'unknown') {
+      unknown += secs;
+      // 过长间隔未知只在最终未知时段内按实际时间计并集:同一子片段内
+      // 任一成员有过长区间即计一次,不叠加成员秒数。
+      if (sl.gaps.length > 0) {
+        gapUnknown += secs;
+        mergeGaps(gaps, sl.gaps);
+      }
+    } else {
+      valid += secs;
+      consumption += sl.consumption;
+    }
+  }
+  return {
+    valid,
+    anomaly,
+    unknown,
+    gapUnknown,
+    gaps,
+    consumption,
+    periods: buildGroupPeriods(versions, segStart, segEnd),
+  };
 }
 
 /**

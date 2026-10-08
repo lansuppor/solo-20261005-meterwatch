@@ -3,6 +3,7 @@ import { cmdDaily } from './src/report.ts';
 import { cmdAck, cmdAlerts, cmdEvaluate, cmdRuleCreate, cmdRuleList } from './src/alerts.ts';
 import { cmdGroupConfigure, cmdGroupDaily, cmdGroupHistory } from './src/groups.ts';
 import { cmdGroupScheduleReport, canonicalizeExceptions, canonicalizeWindows, parseSchedule } from './src/schedule.ts';
+import { cmdGroupCompare } from './src/compare.ts';
 import { cmdCorrect, cmdCorrections, cmdUndo } from './src/correct.ts';
 import { cmdBackup, cmdRescue, cmdRestore, withDirectoryCoordination, withRescueCoordination } from './src/backup.ts';
 import { parseIso8601, parseUtcDate } from './src/time.ts';
@@ -44,6 +45,10 @@ Usage:
   node app.ts group schedule-report --id <id> --schedule <时间表文件> --from <iso> --to <iso>
                                     [--tz <时区>] [--max-interval <秒>]
                                     按每周窗口与日期例外时间表分运行/非运行时段的分组能耗报表(只读)
+  node app.ts group compare --id <id> \
+    --reference-from <iso> --reference-to <iso> --compare-from <iso> --compare-to <iso> \
+    [--max-interval <秒>]
+                                    同一分组两个等长时段的只读能耗对比(按距各自起点的经过秒数对齐)
   node app.ts correct --request <id> --item --device <设备> --at <iso> --expect <kWh> --set <kWh>
                                     [--item --device ... --at ... --expect ... --set ...]...
                                     批量修正已存读数的累计值(整批成功或整批拒绝)
@@ -205,6 +210,31 @@ Usage:
   存储、不自动评估,修正撤销后重查使用当前读数。成功(含不可计算结果)
   返回 0;非法时间表、参数或未知时区返回 2;时间表文件不可读、未知分组、
   所用存储损坏或全库重复读数身份返回 1,指出原因,不输出部分报表。
+
+两期能耗对比(group compare,只读):
+  输入已有分组 --id 与参考期、比较期各自的 --reference-from/--reference-to、
+  --compare-from/--compare-to(均为起点含、终点不含,秒精度 ISO8601,带 Z
+  或数字时区偏移,各自起点必须更早);两期实际秒数必须相等,可重叠或相同。
+  对齐按距各自起点的实际经过秒数一一对应,不按当地钟表或自然日配对(夏令时、
+  不同偏移不影响配对)。各侧独立使用当时生效的成员版本与各自的完整读数
+  时序,成员不同仍可比较,报表分别显示两侧成员与生效时段;成员切换与对齐
+  边界不重置各设备原读数区间的分摊起点。单侧状态口径与 group daily 相同:
+  首版前、读数首末之外与孤立读数为未知;任一成员下降优先为异常,否则任一
+  成员未知为未知,全部可信才有效;非下降相邻区间超过 --max-interval(正
+  整数秒,可选,省略无上限,同一限制用于两侧且不持久化)整段未知,等于限制
+  可信,不能因裁切或配对变短而可信;BigInt 精确计算,kWh 固定三位小数。
+  仅双方同时有效的对齐片段计入可比能耗;其余片段任一侧异常归为异常排除,
+  否则归为未知排除。共同可比、异常排除、未知排除秒数之和等于一期时长,不
+  叠加两侧秒数。报表显示两侧自身有效/异常/未知覆盖、成对 UTC 时段、排除
+  原因(长间隔原因指出侧别、设备及原相邻读数时刻)与采用限制。汇总在同一
+  可比集合上给出两侧估算消耗与比较期减参考期的有符号差值;两侧全有效时各
+  侧消耗与对应范围、同限制的分组日报汇总一致;在相同经过秒数处分段查询后
+  覆盖、消耗及差值分别相加与完整查询一致。共同可比少于全长标 INCOMPLETE,
+  不以零填缺失、不外推;可比覆盖为零时两侧及差值明确无法计算,有效零增长
+  显示 0.000。报表不改业务存储、不自动评估;修正、撤销或补录成员后重查
+  用当前数据,旧告警状态与事件消耗保留。成功(含不可计算)返回 0;非法
+  参数或两期不等长返回 2;未知分组、所用存储损坏不可读或全库重复读数身份
+  返回 1,指出原因且不输出部分报表。
 
 时间表文件格式(每周运行窗口 + 日期例外,group schedule-report 的 --schedule 与
   分组规则 rule create 的 --schedule 共用):
@@ -737,7 +767,71 @@ function cmdGroup(rest: string[]): number {
     }
     return cmdGroupScheduleReport({ id, schedulePath: scheduleRaw, from, to, tz, maxInterval });
   }
-  if (sub === undefined) return usageError("'group' 需要子命令 configure、history、daily 或 schedule-report");
+  if (sub === 'compare') {
+    const flags = parseFlags(
+      subrest,
+      ['--id', '--reference-from', '--reference-to', '--compare-from', '--compare-to', '--max-interval'],
+    );
+    if (typeof flags === 'string') return usageError(flags);
+    const idRaw = oneFlag(flags, '--id');
+    const refFromRaw = oneFlag(flags, '--reference-from');
+    const refToRaw = oneFlag(flags, '--reference-to');
+    const cmpFromRaw = oneFlag(flags, '--compare-from');
+    const cmpToRaw = oneFlag(flags, '--compare-to');
+    if (idRaw === null || refFromRaw === null || refToRaw === null || cmpFromRaw === null || cmpToRaw === null) {
+      return usageError(
+        "'group compare' 需要 --id、--reference-from、--reference-to、--compare-from、--compare-to 各恰好一个(起点含、终点不含)",
+      );
+    }
+    const maxIntervalList = flags.get('--max-interval');
+    if (maxIntervalList !== undefined && maxIntervalList.length !== 1) {
+      return usageError("'group compare' 的 --max-interval 只能出现一次");
+    }
+    const id = idRaw.trim();
+    if (id === '') return usageError('分组标识不能为空');
+    const parseTs = (raw: string, opt: string): number | string => {
+      const ts = parseIso8601(raw.trim());
+      if (ts === null) {
+        return `选项 '${opt}' 的时间无效: '${raw.trim()}'(需秒精度 ISO8601,带 Z 或数字时区偏移)`;
+      }
+      return ts;
+    };
+    const refFrom = parseTs(refFromRaw, '--reference-from');
+    if (typeof refFrom === 'string') return usageError(refFrom);
+    const refTo = parseTs(refToRaw, '--reference-to');
+    if (typeof refTo === 'string') return usageError(refTo);
+    const cmpFrom = parseTs(cmpFromRaw, '--compare-from');
+    if (typeof cmpFrom === 'string') return usageError(cmpFrom);
+    const cmpTo = parseTs(cmpToRaw, '--compare-to');
+    if (typeof cmpTo === 'string') return usageError(cmpTo);
+    if (refFrom >= refTo) return usageError('参考期起点必须早于终点(--reference-from < --reference-to)');
+    if (cmpFrom >= cmpTo) return usageError('比较期起点必须早于终点(--compare-from < --compare-to)');
+    if (refTo - refFrom !== cmpTo - cmpFrom) {
+      return usageError(
+        `参考期与比较期实际秒数必须相等(参考期 ${refTo - refFrom}s,比较期 ${cmpTo - cmpFrom}s);` +
+          '对齐按距各自起点的经过秒数,不按当地钟表或自然日配对',
+      );
+    }
+    let maxInterval: number | undefined;
+    if (maxIntervalList !== undefined) {
+      const parsed = parseMaxInterval(maxIntervalList[0]);
+      if (parsed === null) {
+        return usageError(`选项 '--max-interval' 的值无效: '${maxIntervalList[0].trim()}'(需正整数秒数)`);
+      }
+      maxInterval = parsed;
+    }
+    return cmdGroupCompare({
+      id,
+      referenceFrom: refFrom,
+      referenceTo: refTo,
+      compareFrom: cmpFrom,
+      compareTo: cmpTo,
+      maxInterval,
+    });
+  }
+  if (sub === undefined) {
+    return usageError("'group' 需要子命令 configure、history、daily、schedule-report 或 compare");
+  }
   return usageError(`无法识别的 group 子命令 '${sub}'`);
 }
 
