@@ -31,8 +31,18 @@
 //   状态持久留存到 rescue-preserved-<序号>/ 并报告位置(留存不完整绝不
 //   替换;留存材料不被启动或后续恢复自动清理),再把三个存储整体替换为
 //   校验过的快照。救援自身用 rescue.journal 记录阶段(preserving →
-//   committing → rolling-back → done),被中断后任一命令启动先续接为完整
-//   快照或完整退回救援前状态,绝不开放混合库;确定回退后不得改向。
+//   committing → rolling-back → done)。
+//
+//   关键:开始替换前先落地一个与救援日志相互独立、只建不改的回退方向标记
+//   rescue-rollback(内嵌一份完整救援记录)。从开始替换到报告成功前,任何
+//   读写/重命名/删除失败——包括三个存储已经全部换入后的“完成记录写入”和
+//   “旧事务材料清理”失败——都返回 1、不输出成功结果,并凭标记把救援整体
+//   还原回救援前全部文件的内容与缺失状态;绝不出现“本次报错、下次启动却
+//   据 committing/done 日志前滚提交快照”。标记在全部收尾成功后才删除,是
+//   成功确认前的最后一道闸门:即使失败发生在救援日志写坏或删除之后,启动
+//   续接也只能完成回退。被中断后任一命令启动先续接为完整快照(仅未开始
+//   替换的 preserving 中断放弃后重做)或完整退回救援前状态,绝不开放混合库;
+//   确定回退后不得改向,回退中再次中断或重试也不改向、不误删已还原文件。
 
 import { createHash } from 'node:crypto';
 import {
@@ -84,6 +94,14 @@ const RESCUE_JOURNAL_FORMAT = 'meterwatch-rescue-journal';
 const RESCUE_NEW_SUFFIX = '.rescue-new';
 const PRESERVED_PREFIX = 'rescue-preserved-';
 const RESCUE_MANIFEST_NAME = 'rescue-manifest.json';
+/**
+ * 回退方向标记(与救援日志相互独立的持久证据)。从开始替换起,任何读写/
+ * 重命名/删除失败——包括三个存储换入后的完成记录写入与事务材料清理失败
+ * ——都先建立此标记(独立文件、只建不改),此后只能回退:即使救援日志仍
+ * 处于 committing/done、或日志本身写坏读不出,启动续接也只还原救援前
+ * 状态,绝不据日志前滚提交。回退收尾后连同救援日志一起删除。
+ */
+const RESCUE_ROLLBACK_MARKER = 'rescue-rollback';
 
 /** 恢复阶段;阶段只能按声明的顺序推进,字段缺失按最保守的 committing 处理。 */
 type RestorePhase = 'preparing' | 'committing' | 'rolling-back' | 'done';
@@ -91,6 +109,21 @@ const PHASES: RestorePhase[] = ['preparing', 'committing', 'rolling-back', 'done
 
 function err(message: string): void {
   console.error(`meterwatch: ${message}`);
+}
+
+/**
+ * 仅供离线回归测试使用的故障注入点:环境变量 METERWATCH_RESCUE_FAULT 以逗号
+ * 给出当前启用的故障点名,命中即抛出一个仿真 I/O 错误。正常使用(未设置该
+ * 变量)时为空操作,不改变任何行为。用于把失败精确送到“完成记录写入 /
+ * 收尾清理 / 回退方向记录与还原”等外部 chflags 难以稳定到达的收尾环节。
+ */
+function rescueFaultPoint(point: string): void {
+  const raw = process.env.METERWATCH_RESCUE_FAULT;
+  if (raw === undefined || raw === '') return;
+  const active = raw.split(',').map((s) => s.trim()).filter((s) => s !== '');
+  if (active.includes(point)) {
+    throw new StoreError(`input/output error (injected fault: ${point})`);
+  }
 }
 
 /** 三个业务存储文件的绝对路径(顺序固定,恢复作为一次提交)。 */
@@ -598,6 +631,78 @@ function removeRescueTemps(dir: string, stores: string[]): void {
   }
 }
 
+/** 回退方向标记是否存在。 */
+function rescueRollbackMarked(dir: string): boolean {
+  return existsSync(join(dir, RESCUE_ROLLBACK_MARKER));
+}
+
+/**
+ * 解析回退方向标记内嵌的救援记录(标记内容是建立标记时救援日志的完整副本),
+ * 结构非法返回 null。这样即使救援日志在收尾中已被删除或写坏,仅凭标记仍能
+ * 完成回退。
+ */
+function parseRescueRollbackMarker(data: unknown): RescueJournal | null {
+  const o = data as Record<string, unknown>;
+  if (
+    o === null ||
+    typeof o !== 'object' ||
+    o.format !== 'meterwatch-rescue-rollback' ||
+    o.version !== 1
+  ) {
+    return null;
+  }
+  const inner = {
+    format: RESCUE_JOURNAL_FORMAT,
+    version: 1,
+    phase: 'rolling-back',
+    preservedDir: o.preservedDir,
+    stores: o.stores,
+    preserved: o.preserved,
+  };
+  const parsed = parseRescueJournal(inner);
+  if (parsed === null) return null;
+  return { ...parsed, phase: 'rolling-back' };
+}
+
+/**
+ * 在开始替换前持久确立回退方向(只建不改,幂等)。先写独立临时文件再原子
+ * 换名;内容为当前救援日志的完整副本。标记一旦落地,本次救援只能回退:
+ * 此后任何失败——换入、完成记录写入、旧事务材料清理、日志删除——都无需
+ * 再成功写入任何方向记录,启动续接见标记即还原救援前状态,绝不因日志处于
+ * committing/done 而前滚提交。标记建立失败时尚未替换任何文件,调用方按
+ * preserving 中止。
+ */
+function markRescueRollback(dir: string, journal: RescueJournal): void {
+  const marker = join(dir, RESCUE_ROLLBACK_MARKER);
+  if (isRegularFile(marker)) return;
+  if (existsSync(marker)) {
+    throw new StoreError(`rescue rollback marker ${marker} exists but is not a regular file`);
+  }
+  const tmp = `${marker}.tmp-${process.pid}`;
+  rescueFaultPoint('rescue-marker'); // 测试:建立回退方向标记失败(替换尚未开始)。
+  writeFileSync(
+    tmp,
+    JSON.stringify(
+      {
+        format: 'meterwatch-rescue-rollback',
+        version: 1,
+        preservedDir: journal.preservedDir,
+        stores: journal.stores,
+        preserved: journal.preserved,
+      },
+      null,
+      2,
+    ) + '\n',
+    'utf8',
+  );
+  renameSync(tmp, marker);
+}
+
+/** 删除回退方向标记(仅回退收尾成功后调用)。 */
+function clearRescueRollbackMarker(dir: string): void {
+  rmSync(join(dir, RESCUE_ROLLBACK_MARKER), { force: true });
+}
+
 /**
  * 救援前滚为完整快照,逐文件幂等,可在任意一步中断后续接。新临时还在则
  * 换入(原位内容先删除,其原始字节已在留存目录);新临时不在则原位必须
@@ -636,6 +741,7 @@ function rescueCommitCleanup(dir: string, journal: RescueJournal): void {
       throw new StoreError(`rescue temp file ${newPath} still present; commit is incomplete`);
     }
   }
+  rescueFaultPoint('rescue-cleanup'); // 测试:换入后旧事务材料清理失败。
   for (const entry of journal.preserved) {
     if (entry.name === JOURNAL_NAME || entry.name.endsWith(OLD_SUFFIX) || entry.name.endsWith(NEW_SUFFIX)) {
       const p = join(dir, entry.name);
@@ -652,7 +758,7 @@ function rescueCommitCleanup(dir: string, journal: RescueJournal): void {
  */
 function rescueRollbackPass(dir: string, journal: RescueJournal): void {
   const preservedDir = join(dir, journal.preservedDir);
-  for (const entry of journal.preserved) {
+  journal.preserved.forEach((entry, index) => {
     const live = join(dir, entry.name);
     const kept = join(preservedDir, entry.name);
     if (entry.hadOld) {
@@ -681,40 +787,95 @@ function rescueRollbackPass(dir: string, journal: RescueJournal): void {
         rmSync(live);
       }
     }
-  }
-}
-
-/** 救援回滚收尾:删除新临时文件与救援日志。留存目录保留,不自动清理。 */
-function rescueRollbackCleanup(dir: string, journal: RescueJournal): void {
-  removeRescueTemps(dir, journal.stores);
-  rmSync(join(dir, RESCUE_JOURNAL_NAME));
+    // 测试:处理完第一个名字后中断回退(制造半回退现场,验证续接幂等、不改向)。
+    if (index === 0) rescueFaultPoint('rescue-rollback-step');
+  });
 }
 
 /**
- * 续接被中断的救援(持锁调用)。依据救援日志阶段决定方向:
- * - preserving:替换尚未开始,退回救援前状态(删新临时与救援日志,留存保留)。
- * - committing/done:只能前滚为完整快照。
- * - rolling-back:只能继续还原救援前状态,不得改向。
- * 无救援日志时清理可能残留的救援临时文件。成功(或无需续接)返回 null;
- * 无法可靠判定或完成时返回错误消息,材料一律保留。
+ * 救援回滚收尾:删除新临时文件、救援日志与回退方向标记。留存目录保留,不
+ * 自动清理。只能在 rescueRollbackPass 完整成功后调用。
  */
-function continueInterruptedRescue(dir: string): string | null {
-  const journalPath = join(dir, RESCUE_JOURNAL_NAME);
-  if (!existsSync(journalPath)) {
-    // 无救援日志:替换未开始(残留新临时文件)或已完整完成。这些残留不属于
-    // 任何活动救援,清理即可;清理失败明确报错,不继续启动。
-    for (const path of storeFiles()) {
-      const leftover = path + RESCUE_NEW_SUFFIX;
-      if (existsSync(leftover)) {
-        try {
-          rmSync(leftover);
-        } catch (e) {
-          return `cannot clean up interrupted rescue leftover ${leftover}: ${(e as Error).message}`;
-        }
+function rescueRollbackCleanup(dir: string, journal: RescueJournal): void {
+  removeRescueTemps(dir, journal.stores);
+  // 救援日志可能已在上一轮收尾中删除(崩溃发生在删日志与删标记之间);标记
+  // 才是方向凭据,日志缺失不阻止回退收尾。
+  rmSync(join(dir, RESCUE_JOURNAL_NAME), { force: true });
+  clearRescueRollbackMarker(dir);
+}
+
+/**
+ * 确立回退方向并把救援完整退回救援前状态(持锁调用)。方向以独立标记为准、
+ * 永久锁定:先确保标记落地,再尽力把救援日志置为 rolling-back(翻转失败不
+ * 改变方向——标记已在),然后幂等还原全部留存名字并收尾。任一步失败都抛
+ * 错,材料保留;调用方据此返回 1 并阻止业务。
+ */
+function finishRescueRollback(dir: string, journal: RescueJournal, reason: string): never {
+  // 方向标记在换入前已建立(此处再确保一次,幂等);即使救援日志翻转失败或
+  // 已被写坏,独立标记仍把方向锁定为回退。
+  markRescueRollback(dir, journal);
+  if (journal.phase !== 'rolling-back') {
+    try {
+      rescueFaultPoint('rescue-rollback-phase'); // 测试:回退方向日志翻转写失败。
+      writeRescueJournalPhase(dir, journal, 'rolling-back');
+    } catch {
+      // 日志翻转失败不改变已确立的回退方向(独立标记仍在);继续尝试还原。
+    }
+  }
+  // 先幂等还原全部留存名字;任一步受阻都保留材料并阻止业务,绝不报告成功。
+  try {
+    rescueRollbackPass(dir, journal);
+  } catch (e) {
+    throw new StoreError(
+      `rescue failed (${reason}); rollback is in progress and could not finish ` +
+        `(${(e as Error).message}); data directory ${dir} keeps all materials needed to restore ` +
+        `the pre-rescue state - run any meterwatch command again to finish it; only the rollback can be completed`,
+    );
+  }
+  // 业务文件已还原,仅差删除新临时/救援日志/方向标记:清理失败同样算失败,
+  // 材料保留,下次启动只能继续完成这次回退。
+  try {
+    rescueRollbackCleanup(dir, journal);
+  } catch (e) {
+    throw new StoreError(
+      `rescue failed (${reason}); pre-rescue files were restored but rollback cleanup could not finish ` +
+        `(${(e as Error).message}); data directory ${dir} keeps its rescue materials - ` +
+        `run any meterwatch command again to complete the rollback`,
+    );
+  }
+  throw new StoreError(`rescue failed: ${reason}; pre-rescue state restored`);
+}
+
+/**
+ * 读取并解析回退方向标记;标记不存在返回 undefined,存在但无法作为常规文件
+ * 读取或结构非法返回 null(无法据此判定)。
+ */
+function readRollbackMarker(dir: string): RescueJournal | null | undefined {
+  const marker = join(dir, RESCUE_ROLLBACK_MARKER);
+  if (!existsSync(marker)) return undefined;
+  if (!isRegularFile(marker)) return null;
+  try {
+    return parseRescueRollbackMarker(JSON.parse(readFileSync(marker, 'utf8')));
+  } catch {
+    return null;
+  }
+}
+
+/** 清理救援自身的死临时文件(新内容临时与日志/标记换名前的临时名)。 */
+function cleanRescueLeftovers(dir: string): string | null {
+  for (const path of storeFiles()) {
+    const leftover = path + RESCUE_NEW_SUFFIX;
+    if (existsSync(leftover)) {
+      try {
+        rmSync(leftover);
+      } catch (e) {
+        return `cannot clean up interrupted rescue leftover ${leftover}: ${(e as Error).message}`;
       }
     }
+  }
+  for (const prefix of [RESCUE_JOURNAL_NAME, RESCUE_ROLLBACK_MARKER]) {
     for (const entry of readdirSync(dir)) {
-      if (entry.startsWith(`${RESCUE_JOURNAL_NAME}.tmp-`)) {
+      if (entry.startsWith(`${prefix}.tmp-`)) {
         try {
           rmSync(join(dir, entry));
         } catch (e) {
@@ -722,14 +883,73 @@ function continueInterruptedRescue(dir: string): string | null {
         }
       }
     }
+  }
+  return null;
+}
+
+/**
+ * 续接被中断的救援(持锁调用)。方向判定:
+ * - 回退方向标记(rescue-rollback)存在:方向已永久锁定为回退——即使救援日志
+ *   仍处于 committing/done、已被删除或写坏,也只能还原救援前状态,绝不前滚
+ *   提交。标记内嵌一份完整救援记录,日志不可用时据此回退。
+ * - 无标记时按救援日志阶段:preserving(替换未开始)放弃;committing/done
+ *   前滚为完整快照;rolling-back 继续还原。
+ * 无救援日志也无标记时清理可能残留的临时文件。成功(或无需续接)返回 null;
+ * 无法可靠判定或完成时返回错误消息,材料一律保留。
+ */
+function continueInterruptedRescue(dir: string): string | null {
+  const journalPath = join(dir, RESCUE_JOURNAL_NAME);
+  const markerExists = rescueRollbackMarked(dir);
+
+  // 无标记也无日志:替换未开始(残留临时)或已完整完成,清理死临时即可。
+  if (!markerExists && !existsSync(journalPath)) {
+    const cleanError = cleanRescueLeftovers(dir);
+    if (cleanError !== null) return cleanError;
     return null;
   }
+
   let journal: RescueJournal | null = null;
-  try {
-    journal = parseRescueJournal(JSON.parse(readFileSync(journalPath, 'utf8')));
-  } catch {
-    journal = null;
+  if (existsSync(journalPath)) {
+    try {
+      journal = parseRescueJournal(JSON.parse(readFileSync(journalPath, 'utf8')));
+    } catch {
+      journal = null;
+    }
   }
+
+  // 方向记录:回退标记优先且永久;标记损坏时退回用救援日志(标记本身已证明
+  // 方向为回退);两者都不可用则无法可靠判定,保留材料并阻止业务。
+  let rollbackRecord: RescueJournal | null = null;
+  if (markerExists) {
+    const markerRecord = readRollbackMarker(dir);
+    if (markerRecord === null) {
+      rollbackRecord = journal; // 标记不可读:仅当日志有效时借其记录回退。
+    } else if (markerRecord !== undefined) {
+      rollbackRecord = markerRecord;
+    }
+    if (rollbackRecord === null) {
+      return (
+        `cannot recover data directory ${dir}: rescue rollback marker ${join(dir, RESCUE_ROLLBACK_MARKER)} ` +
+        `and rescue journal ${journalPath} are unreadable or invalid; the directory holds rescue materials ` +
+        `in an unknown state - nothing was deleted; inspect ${RESCUE_ROLLBACK_MARKER}, ${RESCUE_JOURNAL_NAME} ` +
+        `and '${PRESERVED_PREFIX}*' before retrying`
+      );
+    }
+    try {
+      rescueRollbackPass(dir, rollbackRecord);
+      rescueRollbackCleanup(dir, rollbackRecord);
+      err('continued an interrupted rescue rollback: pre-rescue state restored');
+      return null;
+    } catch (e) {
+      return (
+        `cannot complete interrupted rescue rollback for data directory ${dir}: ${(e as Error).message}; ` +
+        `rescue materials were kept (${RESCUE_JOURNAL_NAME}, ${RESCUE_ROLLBACK_MARKER}, ` +
+        `'${PRESERVED_PREFIX}*', '*${RESCUE_NEW_SUFFIX}'); resolve the underlying read/write problem ` +
+        `and run any meterwatch command again - only the rollback can be completed`
+      );
+    }
+  }
+
   if (journal === null) {
     return (
       `cannot recover data directory ${dir}: rescue journal ${journalPath} is unreadable or invalid; ` +
@@ -739,7 +959,8 @@ function continueInterruptedRescue(dir: string): string | null {
   }
   try {
     if (journal.phase === 'preserving') {
-      removeRescueTemps(dir, journal.stores);
+      const cleanError = cleanRescueLeftovers(dir);
+      if (cleanError !== null) return cleanError;
       rmSync(journalPath);
       err('abandoned an interrupted rescue before any replacement: pre-rescue state kept');
       return null;
@@ -761,7 +982,7 @@ function continueInterruptedRescue(dir: string): string | null {
   } catch (e) {
     return (
       `cannot complete interrupted rescue for data directory ${dir}: ${(e as Error).message}; ` +
-      `rescue materials were kept (${RESCUE_JOURNAL_NAME}, '${PRESERVED_PREFIX}*', ` +
+      `rescue materials were kept (${RESCUE_JOURNAL_NAME}, ${RESCUE_ROLLBACK_MARKER}, '${PRESERVED_PREFIX}*', ` +
       `'*${RESCUE_NEW_SUFFIX}'); resolve the underlying read/write problem and run any ` +
       `meterwatch command again`
     );
@@ -777,9 +998,13 @@ function continueInterruptedRescue(dir: string): string | null {
  *     及对应 *.restore-old/*.restore-new 的原始字节与缺失状态写入
  *     rescue-preserved-<序号>/(序号取未使用的最小值,重复救援不丢材料、不改写
  *     历史)。留存不完整绝不替换。
- *  3. committing:整体换入新内容。受控失败先置 rolling-back(此后只能还原
- *     救援前状态,不得改向),再幂等回滚。
- *  4. 成功:置 done,移除活动位置的旧事务材料与救援日志;留存目录保留。
+ *  3. 换入前先落地独立回退方向标记 rescue-rollback(只建不改、内嵌完整记录),
+ *     再置 committing 并整体换入新内容。标记建立失败时尚未替换,按 preserving
+ *     中止。
+ *  4. 三个存储换入后到报告成功前:完成记录写入、旧事务材料清理或方向标记
+ *     撤销任一步失败都返回 1、不输出成功结果,并凭标记把全部固定文件整体
+ *     还原回救援前状态(回滚幂等、确定方向不得改向)。全部收尾成功后才删除
+ *     方向标记并报告成功;留存目录保留。
  * 返回留存目录名(供报告)。
  */
 function performRescue(dir: string, files: Array<{ path: string; body: string }>): string {
@@ -847,52 +1072,45 @@ function performRescue(dir: string, files: Array<{ path: string; body: string }>
     );
   }
 
-  // 阶段三:整体换入新内容。进入 committing 失败时尚未替换任何文件,日志仍
-  // 为 preserving,下次启动按未开始退回。
+  // 阶段三:开始替换前先持久确立回退方向(独立标记,只建不改,内嵌完整救援
+  // 记录)。标记建立失败则绝不开始替换:日志仍为 preserving,材料保留,下次
+  // 启动按未开始放弃。标记一旦落地,此后(含三个存储全部换入后的完成记录
+  // 写入与事务材料清理)任何失败都只能整体还原救援前状态。
+  try {
+    markRescueRollback(dir, journal);
+  } catch (e) {
+    throw new StoreError(
+      `rescue could not record the rollback direction: ${(e as Error).message}; ` +
+        `nothing was replaced; data directory ${dir} keeps its rescue materials - ` +
+        `run any meterwatch command again to return to the pre-rescue state`,
+    );
+  }
   try {
     writeRescueJournalPhase(dir, journal, 'committing');
   } catch (e) {
-    throw new StoreError(
-      `rescue could not enter the commit phase: ${(e as Error).message}; ` +
-        `nothing was replaced; run any meterwatch command again to return to the pre-rescue state`,
-    );
+    // 未替换任何文件;方向标记已在,直接完整退回救援前状态。
+    finishRescueRollback(dir, journal, `could not enter the commit phase (${(e as Error).message})`);
   }
   try {
     rescueRollForwardPass(dir, journal);
   } catch (e) {
-    // 受控失败:确定回退后不得改向;回滚幂等,可中断续接。
-    try {
-      writeRescueJournalPhase(dir, journal, 'rolling-back');
-    } catch (we) {
-      throw new StoreError(
-        `rescue failed (${(e as Error).message}) and the rollback could not be started ` +
-          `(${(we as Error).message}); data directory ${dir} keeps its rescue materials - ` +
-          `run any meterwatch command again to continue the rollback`,
-      );
-    }
-    try {
-      rescueRollbackPass(dir, journal);
-      rescueRollbackCleanup(dir, journal);
-    } catch (re) {
-      throw new StoreError(
-        `rescue failed (${(e as Error).message}); rollback is in progress and could not finish ` +
-          `(${(re as Error).message}); data directory ${dir} keeps all materials needed to restore ` +
-          `the pre-rescue state - run any meterwatch command again to finish it`,
-      );
-    }
-    throw new StoreError(`rescue failed: ${(e as Error).message}; pre-rescue state restored`);
+    // 受控失败:方向标记已在换入前落地,确定回退后不得改向;回滚幂等,
+    // 可跨中断续接。
+    finishRescueRollback(dir, journal, (e as Error).message);
   }
 
-  // 阶段四:提交已落地,记录完成并收尾。收尾失败不影响快照一致性,下次启动
-  // 会完成清理。
+  // 阶段四:三个存储已整体换入。从此刻到报告成功前,完成记录写入、旧事务
+  // 材料清理或方向标记撤销任一步失败都返回 1、不输出成功结果,并整体还原
+  // 救援前全部文件(绝不留下“报错却已提交、下次启动前滚为快照”的状态)。
+  // 标记是成功确认前的最后一道闸门:它在全部清理成功后才删除,故即使失败
+  // 发生在日志写坏/删除之后,续接也只会完成回退,绝不据 committing/done 前滚。
   try {
+    rescueFaultPoint('rescue-done'); // 测试:三个存储换入后,完成记录写入失败。
     writeRescueJournalPhase(dir, journal, 'done');
     rescueCommitCleanup(dir, journal);
+    clearRescueRollbackMarker(dir);
   } catch (e) {
-    throw new StoreError(
-      `snapshot state was committed but post-rescue cleanup failed: ${(e as Error).message}; ` +
-        `run any meterwatch command again to finish cleanup`,
-    );
+    finishRescueRollback(dir, journal, `post-commit finalization failed (${(e as Error).message})`);
   }
   return preservedDir;
 }
